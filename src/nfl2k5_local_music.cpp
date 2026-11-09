@@ -10,6 +10,9 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <wchar.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -17,6 +20,28 @@ extern "C" long nfl2k5_wma_transcode_utf8(const char *src, const char *dst);
 extern "C" int nfl2k5_asf_strip_tags_utf8(const char *path);
 
 namespace {
+
+/* Paths as UTF-8 and files opened by their real (wide) name. On Windows
+ * path::string() converts to the ANSI code page and THROWS for a name outside
+ * it (an accented or Japanese song name on an English system): in 0.8.0 that
+ * exception left the music thread and the game closed at boot (0xC0000409). */
+static std::string u8(const fs::path &p)
+{
+    return p.u8string();   /* C++17: UTF-8 in a std::string, from the wide name; no code page */
+}
+
+static FILE *open_path(const fs::path &p, const char *mode)
+{
+#ifdef _WIN32
+    wchar_t wm[8];
+    size_t i = 0;
+    for (; mode[i] && i + 1 < 8; i++) wm[i] = (wchar_t)mode[i];
+    wm[i] = 0;
+    return _wfopen(p.c_str(), wm);
+#else
+    return fopen(p.c_str(), mode);
+#endif
+}
 
 struct Song {
     fs::path src, cache;
@@ -75,7 +100,7 @@ static std::u16string u8_to_u16(const std::string &s)
 static bool is_audio(const fs::path &p)
 {
     static const char *const exts[] = { ".mp3", ".wma", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".mp4" };
-    std::string ext = p.extension().string();
+    std::string ext = u8(p.extension());
     for (char &c : ext) c = (char)std::tolower((unsigned char)c);
     for (const char *x : exts) {
         if (ext == x) return true;
@@ -86,8 +111,8 @@ static bool is_audio(const fs::path &p)
 // Natural sort ("2 Track" before "10 Track") replacing StrCmpLogicalW
 static bool natural_less(const fs::path &pa, const fs::path &pb)
 {
-    std::string a = pa.filename().string();
-    std::string b = pb.filename().string();
+    std::string a = u8(pa.filename());
+    std::string b = u8(pb.filename());
     size_t ia = 0, ib = 0;
     while (ia < a.size() && ib < b.size()) {
         if (std::isdigit((unsigned char)a[ia]) && std::isdigit((unsigned char)b[ib])) {
@@ -106,20 +131,33 @@ static bool natural_less(const fs::path &pa, const fs::path &pb)
     return a.size() < b.size();
 }
 
+/* A folder's entries; never throws (an unreadable folder or entry is logged and left out). */
 static std::vector<fs::path> list(const fs::path &dir, bool want_dirs)
 {
     std::vector<fs::path> out;
     std::error_code ec;
-    if (!fs::exists(dir, ec)) return out;
-    for (const auto &entry : fs::directory_iterator(dir, ec)) {
-        std::string name = entry.path().filename().string();
-        if (name.empty() || name[0] == '.') continue;
-        bool is_d = entry.is_directory(ec);
-        if (is_d != want_dirs) continue;
-        if (want_dirs || is_audio(entry.path()))
-            out.push_back(entry.path());
+    try {
+        if (!fs::exists(dir, ec)) return out;
+        fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::error_code e2;
+            const fs::path &p = it->path();
+            std::string name = u8(p.filename());
+            if (name.empty() || name[0] == '.') continue;
+            bool is_d = it->is_directory(e2);
+            if (e2 || is_d != want_dirs) continue;
+            if (want_dirs || is_audio(p))
+                out.push_back(p);
+        }
+        if (ec)
+            fprintf(stderr, "[MUSIC] could not read all of folder %s (%s); using what was read\n",
+                    u8(dir).c_str(), ec.message().c_str());
+        std::sort(out.begin(), out.end(), natural_less);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[MUSIC] skipped folder %s: %s\n", u8(dir).c_str(), e.what());
+    } catch (...) {
+        fprintf(stderr, "[MUSIC] skipped folder %s\n", u8(dir).c_str());
     }
-    std::sort(out.begin(), out.end(), natural_less);
     return out;
 }
 
@@ -136,7 +174,7 @@ static std::string strip_track_prefix(std::string t)
 
 static std::u16string title_from_name(const fs::path &file)
 {
-    std::string t = strip_track_prefix(file.stem().string());
+    std::string t = strip_track_prefix(u8(file.stem()));
     size_t dash = t.find(" - ");
     if (dash != std::string::npos) t = t.substr(dash + 3);
     return u8_to_u16(t);
@@ -144,7 +182,7 @@ static std::u16string title_from_name(const fs::path &file)
 
 static std::u16string artist_from_name(const fs::path &file)
 {
-    std::string t = strip_track_prefix(file.stem().string());
+    std::string t = strip_track_prefix(u8(file.stem()));
     size_t dash = t.find(" - ");
     return dash == std::string::npos ? u"" : u8_to_u16(t.substr(0, dash));
 }
@@ -156,7 +194,7 @@ static uint32_t read_asf_duration_ms(const fs::path &wma_path)
         0xA1,0xDC,0xAB,0x8C,0x47,0xA9,0xCF,0x11,
         0x8E,0xE4,0x00,0xC0,0x0C,0x20,0x53,0x65
     };
-    FILE *f = fopen(wma_path.string().c_str(), "rb");
+    FILE *f = open_path(wma_path, "rb");
     if (!f) return 0;
 
     uint8_t buf[4096];
@@ -191,7 +229,8 @@ static void read_tags(Song &s)
 {
     s.title = title_from_name(s.src);
     s.artist = artist_from_name(s.src);
-    if (fs::exists(s.cache))
+    std::error_code ec;
+    if (fs::exists(s.cache, ec))
         s.ms = read_asf_duration_ms(s.cache);
 }
 
@@ -209,7 +248,7 @@ static fs::path cache_name(const fs::path &src)
             h *= 1099511628211ull;
         }
     };
-    std::string lower = src.string();
+    std::string lower = u8(src);
     for (char &c : lower) c = (char)std::tolower((unsigned char)c);
     mix(lower.data(), lower.size());
     mix(&fsize, sizeof fsize);
@@ -274,8 +313,11 @@ static void write_db()
     for (auto &g : groups) db.insert(db.end(), g.begin(), g.end());
 
     fs::path tmp = g_out / "ST.DB.new", dst = g_out / "ST.DB";
-    FILE *f = fopen(tmp.string().c_str(), "wb");
-    if (!f) return;
+    FILE *f = open_path(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "[MUSIC] could not write %s\n", u8(tmp).c_str());
+        return;
+    }
     fwrite(db.data(), 1, db.size(), f);
     fclose(f);
 
@@ -289,7 +331,7 @@ static void write_db()
 
 static void link_song(size_t a, size_t k)
 {
-    std::string cache_str = g_albums[a].songs[k].cache.string();
+    std::string cache_str = u8(g_albums[a].songs[k].cache);
     nfl2k5_asf_strip_tags_utf8(cache_str.c_str());
 
     char dir_buf[32], file_buf[32];
@@ -307,12 +349,61 @@ static void link_song(size_t a, size_t k)
     }
 }
 
-static int SDLCALL worker(void *)
+/* One playlist per folder that holds songs: Music\<folder>, its sub-folders
+ * too (named "folder / sub", up to 3 levels down), and songs left loose in
+ * Music itself ("Music"). */
+static void collect_albums(const fs::path &dir, const std::string &name, int depth, size_t &total, size_t &todo)
+{
+    if (SDL_GetAtomicInt(&g_music_stop) || g_albums.size() >= 100) return;
+    std::error_code ec;
+    Album al;
+    al.name = u8_to_u16(name);
+    for (const fs::path &f : list(dir, false)) {
+        if (SDL_GetAtomicInt(&g_music_stop)) break;
+        try {
+            Song s;
+            s.src = f;
+            s.cache = cache_name(s.src);
+            s.ready = fs::exists(s.cache, ec);
+            read_tags(s);
+            if (!s.ready) todo++;
+            al.songs.push_back(s);
+            total++;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "[MUSIC] skipped %s: %s\n", u8(f).c_str(), e.what());
+        } catch (...) {
+            fprintf(stderr, "[MUSIC] skipped %s\n", u8(f).c_str());
+        }
+    }
+    if (!al.songs.empty()) g_albums.push_back(al);
+    if (depth >= 3) return;
+    for (const fs::path &d : list(dir, true)) {
+        std::string sub = u8(d.filename());
+        collect_albums(d, name.empty() ? sub : name + " / " + sub, depth + 1, total, todo);
+    }
+}
+
+/* A song the converter refused once is not tried again at every start
+ * (cache\<id>.bad); it is retried when the file changes (a new id). */
+static fs::path bad_marker(const Song &s)
+{
+    fs::path b = s.cache;
+    b.replace_extension(".bad");
+    return b;
+}
+
+static int SDLCALL worker_body(void *)
 {
     SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
-    size_t total = 0, todo = 0;
+    size_t total = 0, todo = 0, failed = 0, skipped_bad = 0;
     std::error_code ec;
-    std::vector<fs::path> album_dirs = list(g_music, true);
+    {   /* songs loose in Music itself */
+        size_t before = g_albums.size();
+        collect_albums(g_music, "", 3, total, todo);
+        if (g_albums.size() > before) g_albums.back().name = u"Music";
+    }
+    for (const fs::path &d : list(g_music, true))
+        collect_albums(d, u8(d.filename()), 1, total, todo);
 #ifdef NFL2K5_UWP
     /* UWP/Xbox: more song folders (LocalState\Music, a USB folder named in
      * LocalState\music.txt), ';'-separated UTF-8, from uwp_game.cpp. */
@@ -324,29 +415,13 @@ static int SDLCALL worker(void *)
             if (e > p) {
                 fs::path more = fs::u8path(all.substr(p, e - p));
                 if (!fs::equivalent(more, g_music, ec))
-                    for (const fs::path &d : list(more, true)) album_dirs.push_back(d);
+                    for (const fs::path &d : list(more, true))
+                        collect_albums(d, u8(d.filename()), 1, total, todo);
             }
             p = e + 1;
         }
     }
 #endif
-    for (const fs::path &dir : album_dirs) {
-        if (SDL_GetAtomicInt(&g_music_stop)) break;
-        Album al;
-        al.name = u8_to_u16(dir.filename().string());
-        for (const fs::path &f : list(dir, false)) {
-            if (SDL_GetAtomicInt(&g_music_stop)) break;
-            Song s;
-            s.src = f;
-            s.cache = cache_name(s.src);
-            s.ready = fs::exists(s.cache, ec);
-            read_tags(s);
-            if (!s.ready) todo++;
-            al.songs.push_back(s);
-            total++;
-        }
-        if (!al.songs.empty()) g_albums.push_back(al);
-    }
     fprintf(stderr, "[MUSIC] library: %zu playlists, %zu songs, %zu to convert\n", g_albums.size(), total, todo);
     /* Publish only after all Album/Song entries have been appended. */
     SDL_SetAtomicInt(&g_music_ready, 1);
@@ -363,13 +438,19 @@ static int SDLCALL worker(void *)
             if (SDL_GetAtomicInt(&g_music_stop)) break;
             Song &s = g_albums[a].songs[k];
             if (s.ready) continue;
+            if (fs::exists(bad_marker(s), ec)) { skipped_bad++; continue; }
             fs::path part = s.cache;
             part.replace_extension(".part.wma");
-            long r = nfl2k5_wma_transcode_utf8(s.src.string().c_str(), part.string().c_str());
-            fs::rename(part, s.cache, ec);
+            std::error_code fsz;
+            long r = fs::file_size(s.src, fsz) == 0 && !fsz ? -2 : nfl2k5_wma_transcode_utf8(u8(s.src).c_str(), u8(part).c_str());
+            if (!r) fs::rename(part, s.cache, ec);
             if (r || ec) {
-                fprintf(stderr, "[MUSIC] could not convert %s (0x%08lX)\n", s.src.string().c_str(), (unsigned long)r);
+                fprintf(stderr, "[MUSIC] skipped %s: %s (0x%08lX); fix or remove the file, the game plays the rest\n",
+                        u8(s.src).c_str(), r == -2 ? "empty file" : r ? "not a song the converter can read" : "could not keep the converted copy",
+                        (unsigned long)r);
                 fs::remove(part, ec);
+                if (FILE *m = open_path(bad_marker(s), "wb")) fclose(m);
+                failed++;
                 continue;
             }
             if (!s.ms) s.ms = read_asf_duration_ms(s.cache);
@@ -378,7 +459,22 @@ static int SDLCALL worker(void *)
             write_db();
         }
     }
-    fprintf(stderr, "[MUSIC] library ready\n");
+    fprintf(stderr, "[MUSIC] library ready (%zu skipped as unreadable, %zu skipped from earlier runs)\n", failed, skipped_bad);
+    return 0;
+}
+
+/* Nothing in the music library may stop the game: whatever goes wrong in the
+ * scan is logged, the songs read so far stay, and the game starts anyway. */
+static int SDLCALL worker(void *arg)
+{
+    try {
+        return worker_body(arg);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[MUSIC] library scan stopped: %s (the game goes on without the rest)\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "[MUSIC] library scan stopped by an unknown error (the game goes on without the rest)\n");
+    }
+    SDL_SetAtomicInt(&g_music_ready, 1);
     return 0;
 }
 

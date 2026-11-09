@@ -7,6 +7,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+/* A UTF-8 path opened by its real name (on Windows fopen takes the ANSI code page). */
+static FILE *fopen_utf8(const char *path, const char *mode)
+{
+#if defined(_WIN32)
+    wchar_t wp[1024], wm[8];
+    size_t i = 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 1024)) return NULL;
+    for (; mode[i] && i + 1 < 8; i++) wm[i] = (wchar_t)mode[i];
+    wm[i] = 0;
+    return _wfopen(wp, wm);
+#else
+    return fopen(path, mode);
+#endif
+}
 
 // Portable UTF-8 version of the ASF Extended Content Description tag stripper.
 // The XDK WMA decoder rejects files containing WM/Encoder or Lavf tags.
@@ -16,7 +34,7 @@ extern "C" int nfl2k5_asf_strip_tags_utf8(const char *path)
         0x40,0xA4,0xD0,0xD2,0x07,0xE3,0xD2,0x11,
         0x97,0xF0,0x00,0xA0,0xC9,0x5E,0xA8,0x50
     };
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
 
     fseek(f, 0, SEEK_END);
@@ -59,7 +77,7 @@ extern "C" int nfl2k5_asf_strip_tags_utf8(const char *path)
         memcpy(d + 16, &out, 8);
         memcpy(d + 24, &keep, 4);
         size_t total = (size_t)(out + (got - hsize));
-        f = fopen(path, "wb");
+        f = fopen_utf8(path, "wb");
         if (f) {
             fwrite(d, 1, total, f);
             fclose(f);
@@ -203,13 +221,24 @@ done:
     return SUCCEEDED(hr) ? 0 : (long)hr;
 }
 
+/* A damaged file must not take the game down: a fault inside a Media
+ * Foundation decoder is caught here and reported as a failed conversion. */
+static long transcode_guarded(const wchar_t *src, const wchar_t *dst)
+{
+    __try {
+        return nfl2k5_wma_transcode(src, dst);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (long)GetExceptionCode();
+    }
+}
+
 extern "C" long nfl2k5_wma_transcode_utf8(const char *src, const char *dst)
 {
     wchar_t wsrc[1024], wdst[1024];
     if (!MultiByteToWideChar(CP_UTF8, 0, src, -1, wsrc, 1024) ||
         !MultiByteToWideChar(CP_UTF8, 0, dst, -1, wdst, 1024))
         return -1;
-    return nfl2k5_wma_transcode(wsrc, wdst);
+    return transcode_guarded(wsrc, wdst);
 }
 
 #else /* POSIX: FFmpeg wmav2 transcode + ASF Extended Content Description strip */
