@@ -28,6 +28,8 @@ public class NFL2K5Activity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        /* the device, its memory and displays, and how the last run ended: for the log */
+        try { DeviceReport.run(this); } catch (Throwable t) { }
         File shared = new File(Environment.getExternalStorageDirectory(), "NFL2K5");
         /* Make Internal storage/NFL2K5/original on first start, so there is a
          * folder to copy the game into (needs the permission below first). */
@@ -59,6 +61,41 @@ public class NFL2K5Activity extends SDLActivity {
             } catch (Exception e) { }
         }
         super.onCreate(savedInstanceState);
+        prefer60Hz();
+    }
+
+    /* Handhelds with a 90/120 Hz panel (the safety profile, DeviceReport.profile):
+     * the game makes 60 frames a second, so the panel is asked for its 60 Hz
+     * mode at the same size, which paces frames evenly. The game's own
+     * frame-rate hint (ANativeWindow_setFrameRate) is only a hint. */
+    private void prefer60Hz() {
+        if (DeviceReport.profile().isEmpty()) return;
+        try {
+            android.view.Display d = getWindowManager().getDefaultDisplay();
+            android.view.Display.Mode cur = d.getMode();
+            if (Math.abs(cur.getRefreshRate() - 60f) < 1f) return;
+            for (android.view.Display.Mode m : d.getSupportedModes()) {
+                if (Math.abs(m.getRefreshRate() - 60f) < 1f && m.getPhysicalWidth() == cur.getPhysicalWidth() &&
+                        m.getPhysicalHeight() == cur.getPhysicalHeight()) {
+                    android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+                    lp.preferredDisplayModeId = m.getModeId();
+                    getWindow().setAttributes(lp);
+                    android.system.Os.setenv("NFL2K5_DISPLAY_MODE", "asked for 60 Hz mode " + m.getModeId() +
+                                             " (was " + Math.round(cur.getRefreshRate()) + " Hz)", true);
+                    return;
+                }
+            }
+        } catch (Exception e) { }
+    }
+
+    /* Android asking apps to free memory: into the game's log (a phone that
+     * kills the game for memory shows these first). */
+    private static native void nativeTrimMemory(int level);
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        try { nativeTrimMemory(level); } catch (Throwable t) { }
     }
 
     /* ---- Phone Settings > Add Songs (src/platform/android/android_settings.c) ----
