@@ -39,7 +39,14 @@ void nfl2k5_broadcast_cam_set_enabled(int on);
 
 /* Per-frame guest-thread service (called from the port-0 XInput poll, like
  * Coach Mode). Reads game state and writes the camera; never consumes input.
- * pad_buttons/left_x..right_y are the live pad, used only by Free Cam. */
+ * pad_buttons/left_x..right_y are the live pad, used only by Free Cam: the
+ * sticks are port 0's, the buttons are every connected controller's (so the
+ * Back + D-pad Up save works from any pad) plus NFL2K5_BCAST_KEY_SAVE while
+ * the keyboard's F5 is down. */
+#define NFL2K5_BCAST_KEY_SAVE 0x00010000u
+/* Port 0's buttons as the game should get them: while Free Cam flies, Back
+ * (the game's timeout) arrives a moment late so the Back + Up save can take it. */
+uint32_t nfl2k5_broadcast_cam_game_buttons(uint32_t buttons);
 void nfl2k5_broadcast_cam_service(void);
 void nfl2k5_broadcast_cam_service_pad(uint32_t buttons,
                                       int left_x, int left_y,

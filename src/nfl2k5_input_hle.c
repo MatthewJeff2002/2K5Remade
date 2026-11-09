@@ -103,6 +103,8 @@ static int host_pads_ignored(void)
     return mode == 1 && g_last_script_press && SDL_GetTicks() - g_last_script_press < 15000;
 }
 
+static int s_script_f5;   /* a scripted "f5" press is being held */
+
 static WORD file_press(BYTE analog[8])
 {
     static char queue[64][8];
@@ -154,6 +156,8 @@ static WORD file_press(BYTE analog[8])
         if (!strcmp(name, "start")) buttons |= 0x10;
         else if (!strcmp(name, "back")) buttons |= 0x20;
         else if (!strcmp(name, "back+r3")) buttons |= 0xA0;      /* the audio report combo */
+        else if (!strcmp(name, "back+up")) buttons |= 0x21;      /* My Camera save (Free Cam) */
+        else if (!strcmp(name, "f5")) s_script_f5 = 1;           /* the keyboard My Camera save */
         else if (!strcmp(name, "up")) buttons |= 0x01;
         else if (!strcmp(name, "down")) buttons |= 0x02;
         else if (!strcmp(name, "left")) buttons |= 0x04;
@@ -170,6 +174,7 @@ static WORD file_press(BYTE analog[8])
         else if (!strcmp(name, "r3")) buttons |= 0x80;
         if (now - step_start >= (Uint64)hold) {
             pressing = 0;
+            s_script_f5 = 0;
             step_start = now;
             head = (head + 1) % 64;
         }
@@ -186,6 +191,20 @@ static int window_focused(void)
     if (!win) return 0;
     return (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
+
+#if !defined(__ANDROID__)
+/* F5: save the Free Cam spot as My Camera (src/nfl2k5_broadcast_cam.c), for
+ * playing without a pad. Only while the game window has focus. */
+static int mycam_key_down(void)
+{
+    int numkeys = 0;
+    const bool *kbd;
+    if (s_script_f5) return 1;
+    if (!window_focused()) return 0;
+    kbd = SDL_GetKeyboardState(&numkeys);
+    return kbd && (int)SDL_SCANCODE_F5 < numkeys && kbd[SDL_SCANCODE_F5];
+}
+#endif
 
 static int mouse_hle_on(void)
 {
@@ -521,9 +540,21 @@ int nfl2k5_hle_XInputGetState(void)
          * (Free Cam flies with the pad). No-op unless an angle is selected
          * (src/nfl2k5_broadcast_cam.c). */
         extern void nfl2k5_broadcast_cam_service_pad(uint32_t, int, int, int, int, int, int);
-        nfl2k5_broadcast_cam_service_pad(g.wButtons, g.sThumbLX, g.sThumbLY,
+        extern unsigned nfl2k5_controls_pads_buttons(int first_slot);
+        /* Buttons: port 0 (pad 1, keyboard, scripted presses) plus every
+         * other connected pad, so My Camera's Back + Up save works from any
+         * controller; bit 16 while F5 (or the scripted "f5") is down. */
+        uint32_t cam_buttons = g.wButtons;
+        if (!host_pads_ignored()) cam_buttons |= nfl2k5_controls_pads_buttons(1) & 0xFFFFu;
+        if (mycam_key_down()) cam_buttons |= 0x00010000u;      /* NFL2K5_BCAST_KEY_SAVE */
+        nfl2k5_broadcast_cam_service_pad(cam_buttons, g.sThumbLX, g.sThumbLY,
                                          g.sThumbRX, g.sThumbRY,
                                          g.bAnalogButtons[6], g.bAnalogButtons[7]);
+        {   /* Free Cam: Back (the game's timeout) is held back briefly so
+             * the Back + Up save does not also call a timeout. */
+            extern uint32_t nfl2k5_broadcast_cam_game_buttons(uint32_t);
+            g.wButtons = (WORD)nfl2k5_broadcast_cam_game_buttons(g.wButtons);
+        }
     }
     {   /* ESPN 25th Anniversary moment audio: play a clip when a SOFTDRINK
          * moment (Beast Quake, SB LVIII OT) is launched (nfl2k5_moment_audio.c). */

@@ -508,6 +508,25 @@ int nfl2k5_controls_get(int port, XBOX_GAMEPAD *g, int use_pads)
     return port == 0 || s.connected;
 }
 
+/* The buttons held on every connected controller from `first_slot` up,
+ * through each one's mapping (controls.ini map_*). For pad-wide shortcuts that
+ * must work from whichever pad the player holds, e.g. My Camera's Back + Up. */
+unsigned nfl2k5_controls_pads_buttons(int first_slot)
+{
+    unsigned b = 0;
+    int i;
+    controls_init();
+    for (i = first_slot < 0 ? 0 : first_slot; i < 4; i++) {
+        RawPad s;
+        XBOX_GAMEPAD g;
+        read_sdl_pad(i, &s);
+        if (!s.connected) continue;
+        to_gamepad(&s, &g);
+        b |= g.wButtons;
+    }
+    return b;
+}
+
 int nfl2k5_controls_port_dev(int port)
 {
     RawPad s;

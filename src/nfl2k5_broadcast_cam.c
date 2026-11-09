@@ -84,13 +84,15 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ?
 
 /* ---- My Camera (2026-10-30) ----------------------------------------------
  * The player places the camera with Free Cam and saves it with Back + D-pad
- * Up. What is kept is where the camera sits relative to the ball -- its
+ * Up on any controller (together, or one right after the other) or F5 on the
+ * keyboard (see mycam_combo). What is kept is where the camera sits relative to the ball -- its
  * offset, with the along-the-field part in the offense's direction so the
  * shot flips with possession -- and its zoom. In play the camera holds that
  * offset from the ball and always aims at it, so a deep ball or a long run
  * stays in the picture. Saved in nfl2k5_camera.ini in the user folder. */
 #define BTN_UP   0x0001u
 #define BTN_BACK 0x0020u
+#define BTN_KEY_SAVE NFL2K5_BCAST_KEY_SAVE   /* keyboard F5, folded in by the input layer */
 typedef struct { int have; float dx, dy, dz, fov, ahead, lift; } MyCam;   /* ahead/lift: where it looks, from the ball */
 static MyCam s_my;
 static int s_my_loaded;
@@ -126,19 +128,27 @@ static void mycam_load(void)
     }
 }
 
-static void mycam_save(const MyCam *m)
+static int mycam_save(const MyCam *m)
 {
     char path[MAX_PATH];
     FILE *f = fopen(xbox_user_path("nfl2k5_camera.ini", path, sizeof path), "w");
-    if (!f) return;
+    if (!f) {
+        fprintf(stderr, "[BROADCAST] My Camera NOT saved: cannot write %s\n", path);
+        return 0;
+    }
     fprintf(f, "offset = %.1f %.1f %.1f fov = %.1f\n"
                "aim = %.1f %.1f\n"
                "; My Camera (Pro Broadcast): the camera's position from the ball in cm\n"
                "; (across, up, along the field in the offense's direction) and its field of view.\n"
                "; aim: it looks this far downfield of the ball, and this far above it (0 0 = at the ball).\n"
-               "; Set it in a game: Free Cam, fly to the spot, Back + D-pad Up.\n",
+               "; Set it in a game: Free Cam, fly to the spot, Back + D-pad Up (any controller) or F5.\n",
             m->dx, m->dy, m->dz, m->fov, m->ahead, m->lift);
-    fclose(f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "[BROADCAST] My Camera NOT saved: write to %s failed\n", path);
+        return 0;
+    }
+    fprintf(stderr, "[BROADCAST] My Camera written to %s\n", path);
+    return 1;
 }
 
 /* The way the offense is going: from the ball spot toward the line to gain. */
@@ -265,7 +275,14 @@ static void shot_for(int mode, float tx, float ty, float tz, Shot *s)
     }
 }
 
-/* Free Cam: fly the Sandbox free camera with the pad while the game plays. */
+/* Free Cam: fly the Sandbox free camera with the pad while the game plays.
+ * Between plays (flow outside 11..18) the camera is handed back to the game,
+ * and on the next play it used to start over from the game's own camera, so a
+ * spot flown in one play was gone before the player could save it in the
+ * next. Where it was flown to is kept for the rest of the match and put back
+ * when Free Cam picks up again. */
+static Nfl2k5SandboxWorldState s_fc_keep;
+static uint32_t s_fc_clock;            /* the match (clock object) s_fc_keep belongs to */
 static void service_freecam(float dt)
 {
     float lx = s_lx / 32767.f, ly = s_ly / 32767.f, rx = s_rx / 32767.f, ry = s_ry / 32767.f;
@@ -278,32 +295,18 @@ static void service_freecam(float dt)
         nfl2k5_sandbox_world_set_timescale(1.f);   /* keep the game live while flying */
         nfl2k5_sandbox_world_set_fly_speed(2500.f);
         s_armed = 1;
+        if (s_fc_clock && s_fc_clock == MEM32(CLOCK) && s_fc_keep.camera_ready) {
+            s_fc_keep.timescale = 1.f;
+            nfl2k5_sandbox_world_restore(&s_fc_keep);
+        }
     }
     /* move_x, move_y, look_x, look_y, elevate, zoom */
     nfl2k5_sandbox_world_input(lx, ly, rx, -ry, up, 0.f);
     nfl2k5_sandbox_world_tick(dt);
-    {   /* Back + D-pad Up: keep this spot as My Camera */
-        static uint32_t prev;
-        uint32_t combo = BTN_BACK | BTN_UP;
-        if ((s_btn & combo) == combo && (prev & combo) != combo) {
-            Nfl2k5SandboxWorldState w;
-            float tx, ty, tz;
-            nfl2k5_sandbox_world_get_state(&w);
-            if (w.camera_ready && ball_target(&tx, &ty, &tz)) {
-                MyCam m;
-                update_dir();
-                m.have = 1;
-                m.dx = (w.x - tx) * s_dir; m.dy = w.y - ty; m.dz = (w.z - tz) * s_dir;
-                m.fov = clampf(w.fov, 15.f, 90.f); m.ahead = m.lift = 0.f;
-                s_my = m; s_my_loaded = 1;
-                mycam_save(&m);
-                fprintf(stderr, "[BROADCAST] My Camera saved: offset %.0f,%.0f,%.0f fov %.0f\n",
-                        m.dx, m.dy, m.dz, m.fov);
-                xbox_PresentToast("MY CAMERA", "Camera position saved",
-                                  "Pick \"My Camera\" on the Camera screen to play with it", 3500);
-            }
-        }
-        prev = s_btn;
+    {
+        Nfl2k5SandboxWorldState w;
+        nfl2k5_sandbox_world_get_state(&w);
+        if (w.camera_ready) { s_fc_keep = w; s_fc_clock = MEM32(CLOCK); }
     }
 }
 
@@ -345,6 +348,77 @@ static void service_mycam(float dt)
     nfl2k5_sandbox_world_restore(&w);
 }
 
+/* Back + D-pad Up (on any controller) or F5: keep the Free Cam spot as My
+ * Camera. It fires on the press that completes the pair, whichever of the two
+ * buttons comes second, and it never takes either button from the game. When
+ * the spot cannot be kept a toast says why instead of nothing happening. */
+static void mycam_try_save(uint32_t flow)
+{
+    Nfl2k5SandboxWorldState w;
+    float tx, ty, tz;
+    MyCam m;
+    const char *why = NULL;
+    nfl2k5_sandbox_world_get_state(&w);
+    if (MEM32(IN_GAME) != 3u)
+        why = "Start a game first, then fly Free Cam to the spot";
+    else if (!(flow >= 11u && flow <= 18u))
+        why = "Free Cam is off between plays: wait for the next one, then save";
+    else if (!s_armed || !w.camera_ready)
+        why = "Free Cam isn't flying yet: wait for the field camera";
+    else if (!ball_target(&tx, &ty, &tz))
+        why = "No ball on the field yet: try again at the snap";
+    fprintf(stderr, "[BROADCAST] My Camera save asked: in_game=%u flow=%u armed=%d camera_ready=%d -> %s\n",
+            (unsigned)MEM32(IN_GAME), (unsigned)flow, s_armed, w.camera_ready, why ? why : "saving");
+    if (why) {
+        xbox_PresentToast("MY CAMERA", "Camera not saved", why, 4000);
+        return;
+    }
+    update_dir();
+    m.have = 1;
+    m.dx = (w.x - tx) * s_dir; m.dy = w.y - ty; m.dz = (w.z - tz) * s_dir;
+    m.fov = clampf(w.fov, 15.f, 90.f); m.ahead = m.lift = 0.f;
+    if (!mycam_save(&m)) {
+        xbox_PresentToast("MY CAMERA", "Camera not saved", "Couldn't write nfl2k5_camera.ini", 4000);
+        return;
+    }
+    s_my = m; s_my_loaded = 1;
+    fprintf(stderr, "[BROADCAST] My Camera saved: offset %.0f,%.0f,%.0f fov %.0f (eye %.0f,%.0f,%.0f ball %.0f,%.0f,%.0f)\n",
+            m.dx, m.dy, m.dz, m.fov, w.x, w.y, w.z, tx, ty, tz);
+    xbox_PresentToast("MY CAMERA", "Camera position saved",
+                      "Pick \"My Camera\" on the Camera screen to play with it", 3500);
+}
+
+/* Edge of the save request: Back + D-pad Up, or F5 going down. The pair
+ * counts when the second button goes down while the first is still held, or
+ * within MYCAM_PAIR_MS of the first press: players press "Back + Up" one after
+ * the other as often as together (the 2026-11-08 session log has Up, Back,
+ * Back and never both at once), and the old held-together test never fired. */
+#define MYCAM_PAIR_MS 1000.0
+static int s_pair_fired;                /* the pair completed on this poll (read by the Back filter) */
+static void mycam_combo(uint32_t flow)
+{
+    static uint32_t prev;
+    static double back_at = -1e9, up_at = -1e9;
+    double now = (double)GetTickCount64();
+    uint32_t b = s_btn, down = b & ~prev;
+    int fire = 0;
+    prev = b;
+    if (down & BTN_BACK) {
+        fire = (b & BTN_UP) || now - up_at <= MYCAM_PAIR_MS;
+        back_at = now;
+    }
+    if (down & BTN_UP) {
+        fire |= (b & BTN_BACK) || now - back_at <= MYCAM_PAIR_MS;
+        up_at = now;
+    }
+    if (down & BTN_KEY_SAVE) fire = 1;
+    if (fire) {
+        back_at = up_at = -1e9;            /* one save per pair */
+        if (!(down & BTN_KEY_SAVE) || (b & BTN_BACK)) s_pair_fired = 1;
+        mycam_try_save(flow);
+    }
+}
+
 void nfl2k5_broadcast_cam_service_pad(uint32_t buttons, int lx, int ly, int rx, int ry, int tl, int tr)
 {
     uint32_t flow;
@@ -358,6 +432,25 @@ void nfl2k5_broadcast_cam_service_pad(uint32_t buttons, int lx, int ly, int rx, 
         nfl2k5_ballscan_service(); }
 
     parse_env();
+    {   /* NFL2K5_MYCAM_TRACE=1: log the game state around every Back / Up press
+         * (which flow the press lands in, and where flow goes for 3 s after). */
+        static int trace = -1; static uint32_t tprev, tflow; static double tuntil;
+        if (trace < 0) trace = getenv("NFL2K5_MYCAM_TRACE") != NULL;
+        if (trace) {
+            double nowt = (double)GetTickCount64();
+            uint32_t f = MEM32(FLOW), edge = buttons & ~tprev;
+            if (edge & (BTN_BACK | BTN_UP | BTN_KEY_SAVE)) {
+                fprintf(stderr, "[MYCAM-TRACE] press %05X held %05X mode=%d in_game=%u flow=%u armed=%d\n",
+                        (unsigned)edge, (unsigned)buttons, s_mode, (unsigned)MEM32(IN_GAME), (unsigned)f, s_armed);
+                tuntil = nowt + 3000.0; tflow = f;
+            }
+            if (nowt < tuntil && f != tflow) {
+                fprintf(stderr, "[MYCAM-TRACE] flow %u -> %u (held %05X)\n", (unsigned)tflow, (unsigned)f, (unsigned)buttons);
+                tflow = f;
+            }
+            tprev = buttons;
+        }
+    }
     if (!s_mode) { if (s_in) { release(); s_in = 0; } return; }
     if (MEM32(IN_GAME) != 3u) { if (s_in) { release(); s_in = 0; } return; }
     s_in = 1;
@@ -376,6 +469,9 @@ void nfl2k5_broadcast_cam_service_pad(uint32_t buttons, int lx, int ly, int rx, 
      * (play-call menu flow 5, replays, halftime, period breaks, game over)
      * hands control back to the native camera/presentation. */
     flow = MEM32(FLOW);
+    /* Free Cam's save is read before the play gate so a press outside a
+     * play gets a toast saying why, instead of being dropped. */
+    if (s_mode == NFL2K5_BCAST_FREECAM) mycam_combo(flow);
     if (!(flow >= 11u && flow <= 18u)) { if (s_armed) release(); return; }
 
     now = (double)GetTickCount64();
@@ -452,6 +548,40 @@ void nfl2k5_broadcast_cam_service_pad(uint32_t buttons, int lx, int ly, int rx, 
             }
         }
     }
+}
+
+/* Back is the game's timeout button: on its own, at the line or after the
+ * whistle, it calls a timeout (flow 19). Pressed for the My Camera save it
+ * used to call one too, and the timeout took Free Cam out of play. So while
+ * Free Cam is flying, port 0's Back reaches the game MYCAM_BACK_HOLD_MS late:
+ * if D-pad Up completes the pair in that time the game never sees that Back
+ * (no timeout); otherwise it gets the press as made (held, or a short tap
+ * replayed). Every other angle, and every other moment, Back is untouched.
+ * Called on the port-0 poll right after nfl2k5_broadcast_cam_service_pad. */
+#define MYCAM_BACK_HOLD_MS 500.0
+uint32_t nfl2k5_broadcast_cam_game_buttons(uint32_t b)
+{
+    static int st;                         /* 0 idle, 1 deciding, 2 pair: swallow, 3 game has it */
+    static double since, replay_until;
+    double now = (double)GetTickCount64();
+    int fired = s_pair_fired, held = (b & BTN_BACK) != 0;
+    s_pair_fired = 0;
+    if (!(s_mode == NFL2K5_BCAST_FREECAM && s_in && MEM32(IN_GAME) == 3u)) {
+        st = 0; replay_until = 0;
+        return b;
+    }
+    if (st == 0 && held) { st = 1; since = now; replay_until = 0; }
+    if (st == 1) {
+        if (fired) st = 2;                                  /* Back + Up: the save takes it */
+        else if (now - since >= MYCAM_BACK_HOLD_MS) {
+            if (held) st = 3;                               /* still held: the game gets it now */
+            else { st = 0; replay_until = now + 120.0; }    /* a quick tap: replay it */
+        }
+    }
+    if ((st == 2 || st == 3) && !held) st = 0;
+    b &= ~BTN_BACK;
+    if (st == 3 || now < replay_until) b |= BTN_BACK;
+    return b;
 }
 
 void nfl2k5_broadcast_cam_service(void)
