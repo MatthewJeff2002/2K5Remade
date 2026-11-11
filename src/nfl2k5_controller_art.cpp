@@ -15,6 +15,7 @@
 // Images are 4x the game's, so they stay sharp at high internal resolutions.
 // "Original Xbox" prompts (F1 > Controls) keep the game's own icons.
 // tools/controller-art builds the assets.
+#include "nfl2k5_header_sheet_labels.h"
 #include <windows.h>
 #ifdef _WIN32
 #include <wincodec.h>
@@ -51,7 +52,15 @@ namespace {
 
 const uint32_t kDukeHash = 0xCBDFAE7Fu;     // tex content hash of the Duke picture (DXT1 256x256)
 const uint32_t kSheetHash = 0xBD8DD7ADu;    // decoded BGRA hash of the 128x128 button sheet
-uint32_t g_small_hash = 0;                  // the 64x64 header sheet; found by its layout (below)
+// The 64x64 header-icon sheet (LT/RT/LB/RB/A/Y on the roster and menu headers)
+// comes with more than one palette. It is recognised by the pattern of its
+// pixels alone: each colour renamed by first appearance (0, 1, 2, ...) and those
+// names hashed (label_hash), the same for every palette of this sheet and for
+// nothing else. 0.8.0 guessed by a few bright pixels and learned the first match,
+// so 64x64 sock and leg textures with white stripes got the controller sheet
+// drawn on them (players: "the sock glitch"). Values read from the game with
+// NFL2K5_ART_LOG=1 on screens that show the header icons.
+const uint32_t kSmallLabelHashes[] = { 0x64118247u };   /* team select header, SOFTDRINK v0.9 */
 
 struct Img {
     int w = 0, h = 0;
@@ -350,8 +359,58 @@ const uint32_t *pad_picture(uint32_t *ow, uint32_t *oh)
     return it->second.px.data();
 }
 
-// The 64x64 header sheet is recognised by its layout the first time: grey
-// arrows in the corners and the L icon's white strokes at (20..24, 18..28).
+// Each colour renamed by its first appearance, the names hashed: a palette
+// change keeps the hash, any other picture changes it. 0 for more than 256
+// colours (never a paletted sheet).
+uint32_t label_hash(const uint32_t *p, size_t n)
+{
+    uint32_t keys[512], vals[512], next = 0, h = 2166136261u;
+    bool used[512] = {};
+    for (size_t i = 0; i < n; i++) {
+        uint32_t c = p[i], k = (c * 2654435761u) >> 23, label;
+        while (used[k] && keys[k] != c) k = (k + 1) & 511;
+        if (!used[k]) {
+            if (next >= 256) return 0;
+            used[k] = true; keys[k] = c; vals[k] = next++;
+        }
+        label = vals[k];
+        h = (h ^ label) * 16777619u;
+    }
+    return h ^ next;
+}
+
+bool is_small_sheet(uint32_t lh)
+{
+    for (uint32_t k : kSmallLabelHashes) if (k && k == lh) return true;
+    return false;
+}
+
+// The same picture in a palette that gives two of its colours one value: every
+// pixel that has one label in the game's sheet has one (and the same) colour
+// here. A different picture breaks that within a few pixels.
+bool coarsens_header_sheet(const uint32_t *p)
+{
+    uint32_t col[256];
+    bool set[256] = {};
+    int distinct = 0;
+    for (int i = 0; i < 4096; i++) {
+        unsigned k = kHeaderSheetLabels[i];
+        if (!set[k]) { set[k] = true; col[k] = p[i]; }
+        else if (col[k] != p[i]) return false;
+    }
+    /* a flat or nearly flat texture "coarsens" anything: the sheet keeps most
+     * of its 256 colours in any palette, so ask for many of them */
+    for (int k = 0; k < 256; k++) {
+        bool seen = false;
+        if (!set[k]) continue;
+        for (int j = 0; j < k && !seen; j++) seen = set[j] && col[j] == col[k];
+        if (!seen) distinct++;
+    }
+    return distinct >= 48;
+}
+
+// The 0.8.0 guess, kept only as a logged hint (it matched sock textures):
+// grey arrows in the corners and the L icon's white strokes at (20..24, 18..28).
 bool looks_like_small_sheet(const uint32_t *p)
 {
     auto lum = [&](int x, int y) { uint32_t c = p[y * 64 + x]; return (int)(((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255)) / 3; };
@@ -415,12 +474,27 @@ const uint32_t *override(uint32_t fmt, uint32_t w, uint32_t h, uint32_t content,
         uint32_t dh = fnv(orig, (size_t)w * h);
         if (w == 128 && dh == kSheetHash) r = button_sheet(orig, style, ow, oh);
         else if (w == 64) {
-            if (!g_small_hash && looks_like_small_sheet(orig)) {
-                g_small_hash = dh;
-                if (g_log) fprintf(stderr, "[ART] header sheet hash %08X\n", dh);
+            /* the header sheet in any of its palettes, and nothing else */
+            uint32_t lh = label_hash(orig, (size_t)w * h);
+            if (is_small_sheet(lh) || coarsens_header_sheet(orig)) r = small_sheet(orig, style, ow, oh);
+            {   /* NFL2K5_ART_DUMP_LABELS=<file>: the header sheet's label image (made once, embedded) */
+                const char *dp = getenv("NFL2K5_ART_DUMP_LABELS");
+                static bool dumped;
+                if (dp && !dumped && lh == 0x64118247u) {
+                    uint32_t keys[512], vals[512], next = 0; bool used[512] = {};
+                    FILE *df = fopen(dp, "wb");
+                    for (size_t i = 0; df && i < (size_t)w * h; i++) {
+                        uint32_t c = orig[i], k = (c * 2654435761u) >> 23;
+                        while (used[k] && keys[k] != c) k = (k + 1) & 511;
+                        if (!used[k]) { used[k] = true; keys[k] = c; vals[k] = next++; }
+                        fputc((int)vals[k], df);
+                    }
+                    if (df) fclose(df);
+                    dumped = true;
+                }
             }
-            /* the same sheet comes with more than one palette: every one of them */
-            if (dh == g_small_hash || looks_like_small_sheet(orig)) r = small_sheet(orig, style, ow, oh);
+            if (g_log) fprintf(stderr, "[ART] 64x64 paletted: colour hash %08X label hash %08X old guess %d -> %s\n",
+                               dh, lh, (int)looks_like_small_sheet(orig), r ? "header sheet" : "kept");
         }
         if (g_log && !r) fprintf(stderr, "[ART] %ux%u paletted texture hash %08X (not replaced)\n", w, h, dh);
     }
