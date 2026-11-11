@@ -126,10 +126,23 @@
   }
   function code(t) { var a = (t && t.abbreviation || '').toUpperCase(); return ALIAS[a] || a; }
   function color(t) { return (t && t.primaryColor) || COLORS[code(t)] || '#444a55'; }
-  function logoSrc(t) { var c = code(t); return (!c || missing[c]) ? ((t && t.logo) || '') : 'assets/logos/' + c + '.png'; }
+  /* Logo sources in order: this package's own art (kept local, not in the
+     release), the CBS 2026 package's team logos (shipped with the game),
+     then the team folder's logo. A missing one moves on to the next. */
+  function logoChain(t) {
+    var c = code(t), out = [];
+    if (c) { out.push('assets/logos/' + c + '.png'); out.push('../CBS_2026/assets/logos/' + c + '.png'); }
+    if (t && t.logo) out.push(t.logo);
+    return out;
+  }
+  function logoSrc(t) { var c = code(t), l = logoChain(t), k = missing[c] || 0; return l[k] || ''; }
   function setLogo(img, t) {
     var src = logoSrc(t), c = code(t);
-    img.onerror = function () { if (!missing[c]) { missing[c] = true; img.setAttribute('src', (t && t.logo) || ''); } else img.removeAttribute('src'); };
+    img.onerror = function () {
+      var l = logoChain(t), k = (missing[c] || 0) + 1;
+      missing[c] = k;
+      if (l[k]) img.setAttribute('src', l[k]); else img.removeAttribute('src');
+    };
     if (img.getAttribute('src') !== src) img.setAttribute('src', src);
   }
   function setScorebugLogo(side, t) {
