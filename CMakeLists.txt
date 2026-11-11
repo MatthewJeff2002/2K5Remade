@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(NFL2K5_PC LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
+if(MSVC)
+  # MSVC 14.40+ made std::mutex's constructor constexpr; such a program crashes
+  # on start against an older msvcp140.dll from System32 (a player with an old
+  # Visual C++ 2015-2022 runtime: "it auto-crashes", 0.8.0). Microsoft's switch
+  # keeps the older layout, which works with every msvcp140.dll. C++ only, so
+  # the generated C is not rebuilt for it.
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR>)
+endif()
 add_subdirectory(external/xboxrecomp)
 if(WIN32)
   add_executable(NFL2K5_toolchain_check tools/toolchain_check.cpp)

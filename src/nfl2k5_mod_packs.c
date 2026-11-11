@@ -337,8 +337,11 @@ static void mp_install_one(const char *dir, const char *name)
             snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" --root \"%s\" --replace --log \"%s\"", tool, file, s_root, logp);
         else if (mp_file_exists(py))
             snprintf(cmd, sizeof cmd, "python \"%s\" \"%s\" --root \"%s\" --replace --log \"%s\"", py, file, s_root, logp);
-        else
-            return;
+        else {
+            /* said once (the .failed marker), never silently skipped */
+            snprintf(err, sizeof err, "a disc image needs tools\\NFL2K5-ModPack-Installer.exe; use the pack's .2k5patch instead");
+            goto finish;
+        }
         xbox_PresentToast("MOD PACKS", "Installing", name, 8000);
         memset(&si, 0, sizeof si);
         memset(&pi, 0, sizeof pi);
@@ -362,6 +365,7 @@ static void mp_install_one(const char *dir, const char *name)
         snprintf(err, sizeof err, "a patched disc image can only be installed on the PC; use the pack's .2k5patch here");
 #endif
     }
+finish:
     {
         FILE *m = fopen(ok ? done : failed, "w");
         if (m) {
@@ -395,6 +399,29 @@ static void mp_install_one(const char *dir, const char *name)
     xbox_PresentToast("MOD PACKS", "Installed - restart the game, then", "Extras > Mods to turn it on", 20000);
 }
 
+/* A file still being copied in (a 1.2 GB pack takes a while) is left for the
+ * next look: written in the last few seconds, or open for writing. */
+static int mp_file_settled(const char *path)
+{
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    FILETIME now;
+    ULARGE_INTEGER t, n;
+    HANDLE h;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
+    GetSystemTimeAsFileTime(&now);
+    t.LowPart = a.ftLastWriteTime.dwLowDateTime; t.HighPart = a.ftLastWriteTime.dwHighDateTime;
+    n.LowPart = now.dwLowDateTime; n.HighPart = now.dwHighDateTime;
+    if (n.QuadPart > t.QuadPart && n.QuadPart - t.QuadPart < 50000000ull) return 0;   /* < 5 s */
+    h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;       /* someone still writes it */
+    CloseHandle(h);
+#else
+    (void)path;
+#endif
+    return 1;
+}
+
 static void mp_scan_dir(const char *dir, int iso_too)
 {
     WIN32_FIND_DATAA fd;
@@ -406,8 +433,23 @@ static void mp_scan_dir(const char *dir, int iso_too)
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         if (mp_ends_with(fd.cFileName, ".2k5patch") ||
-                (iso_too && (mp_ends_with(fd.cFileName, ".iso") || mp_ends_with(fd.cFileName, ".xiso"))))
+                (iso_too && (mp_ends_with(fd.cFileName, ".iso") || mp_ends_with(fd.cFileName, ".xiso")))) {
+            char path[MAX_PATH], done[MAX_PATH], failed[MAX_PATH];
+            snprintf(path, sizeof path, "%s/%s", dir, fd.cFileName);
+            snprintf(done, sizeof done, "%s/mods/patches/%s.installed", s_root, fd.cFileName);
+            snprintf(failed, sizeof failed, "%s/mods/patches/%s.failed", s_root, fd.cFileName);
+            if (mp_file_exists(done) || mp_file_exists(failed)) continue;
+            if (!mp_file_settled(path)) {
+                static char told[MAX_PATH];
+                if (strcmp(told, fd.cFileName)) {
+                    snprintf(told, sizeof told, "%s", fd.cFileName);
+                    fprintf(stderr, "[MODPACK] %s is still being copied; installing it when that is done\n", fd.cFileName);
+                    xbox_PresentToast("MOD PACKS", "Found a new mod pack", "It installs as soon as the copy is finished", 8000);
+                }
+                continue;
+            }
             mp_install_one(dir, fd.cFileName);
+        }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
@@ -418,10 +460,15 @@ static DWORD WINAPI mp_patch_thread(void *arg)
     (void)arg;
     Sleep(8000);                                  /* let the game get to its menus first */
     snprintf(dir, sizeof dir, "%s/mods/patches", s_root);
-    mp_scan_dir(dir, 1);
+    /* 0.8.1: watched for the whole run (0.8.0 looked once, 8 s after start,
+     * so a pack put there while playing did nothing until a restart) */
+    for (;;) {
+        mp_scan_dir(dir, 1);
 #ifdef __ANDROID__
-    mp_scan_dir("/sdcard/Download", 0);
+        mp_scan_dir("/sdcard/Download", 0);
 #endif
+        Sleep(10000);
+    }
     return 0;
 }
 

@@ -287,7 +287,30 @@ static LONG CALLBACK crash_report(EXCEPTION_POINTERS *ep)
     }
     fflush(stderr);
     RECOMP_ICALL_FEEDBACK_DUMP();
+#ifndef NFL2K5_UWP
+    {   /* logs\crash-<time>.txt + .dmp and a message (src/nfl2k5_first_run.c) */
+        extern void nfl2k5_crash_report(EXCEPTION_POINTERS *ep, const char *what);
+        nfl2k5_crash_report(ep, NULL);
+    }
+#endif
     return EXCEPTION_EXECUTE_HANDLER;
+}
+
+/* The process-wide last chance: everything that reaches it ends the game, so
+ * every kind gets the report (crash_report above names only the usual four). */
+static LONG CALLBACK crash_report_top(EXCEPTION_POINTERS *ep)
+{
+    LONG r = crash_report(ep);
+#ifndef NFL2K5_UWP
+    if (r == EXCEPTION_CONTINUE_SEARCH) {
+        extern void nfl2k5_crash_report(EXCEPTION_POINTERS *ep, const char *what);
+        fprintf(stderr, "[CRASH] exception=0x%08lX host=0x%llX\n", ep->ExceptionRecord->ExceptionCode,
+                (unsigned long long)ep->ContextRecord->Rip);
+        nfl2k5_crash_report(ep, NULL);
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+#endif
+    return r;
 }
 #else
 static struct sigaction g_prev_segv_sa;
@@ -1617,6 +1640,22 @@ int main(int argc, char **argv)
         }
     }
 #endif
+#if defined(_WIN32) && !defined(NFL2K5_UWP)
+    {   /* 0.8.1: a message instead of a silent exit (src/nfl2k5_first_run.c):
+         * files dropped on the exe, started from the .zip, a folder it cannot
+         * write to, missing release folders, no disc (it can unpack an .iso) */
+        extern int nfl2k5_first_run_args(const char *root, int *argc, char **argv);
+        extern int nfl2k5_first_run_check(const char *root);
+        extern void nfl2k5_crash_init(void);
+        int rc;
+        nfl2k5_crash_init();
+        nfl2k5_first_run_args(root, &argc, argv);
+        if ((rc = nfl2k5_first_run_check(root)) != 0) {
+            fflush(stderr);
+            return rc;
+        }
+    }
+#endif
 
     if (force_retail)
         fprintf(stderr, vanilla ? "[BOOT] --vanilla: clean ESPN NFL 2K5; no mod pack, no feature packs\n"
@@ -1712,7 +1751,7 @@ int main(int argc, char **argv)
 
 #if defined(_WIN32)
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    SetUnhandledExceptionFilter(crash_report);
+    SetUnhandledExceptionFilter(crash_report_top);
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
 #endif
