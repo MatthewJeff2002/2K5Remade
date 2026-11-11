@@ -1207,11 +1207,24 @@ static std::vector<size_t> folder_songs(size_t a)
     return out;
 }
 
+/* The menu font has ASCII only: accented Latin letters lose the accent
+ * ("Beyonce"), anything else shows as '?'. */
+static char ascii_of(char16_t c)
+{
+    static const char latin1[] =                     /* U+00C0..U+00FF */
+        "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYTs" "aaaaaaaceeeeiiii" "dnooooo/ouuuuyty";
+    if (c < 0x80) return (char)c;
+    if (c >= 0xC0 && c <= 0xFF) return latin1[c - 0xC0];
+    if (c == 0x2019 || c == 0x2018) return '\'';
+    if (c == 0x2013 || c == 0x2014) return '-';
+    return '?';
+}
+
 static void text_of(const std::u16string &s, char *out, size_t n)
 {
     size_t i = 0;
     if (n > 49) n = 49;                /* the row's value column */
-    for (; i < s.size() && i + 1 < n; i++) out[i] = s[i] < 0x80 ? (char)s[i] : '?';
+    for (; i < s.size() && i + 1 < n; i++) out[i] = ascii_of(s[i]);
     out[i] = 0;
     if (i < s.size() && i > 3) strcpy(out + i - 3, "...");
 }
