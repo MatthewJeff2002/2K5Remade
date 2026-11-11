@@ -15,11 +15,11 @@ your settings, saves, Music, mods and your own presentation packages are kept
   sub-folders, non-English names and holding a pick until you are back in the
   menus were checked with recorded sound, with SOFTDRINK v0.9 and with the
   original game. Accented names show without the accent instead of "?".
-- **Socks and other small parts drawing the wrong texture** (a grey/yellow
-  machine-like pattern): we could not make it happen on our PC yet, but fixed
-  two renderer faults that produce exactly this (smaller texture versions
-  that were never refreshed, and versions the game never uses). If you still
-  see it, please send a screenshot and your session.log.
+- **The sock glitch**: socks (and other small parts) were painted with the
+  controller button icons. The game's new controller-icon art picked its
+  target by a loose guess that some uniform textures passed; it now replaces
+  only the real icon sheet. Also fixed two renderer faults that could keep
+  stale smaller versions of a texture.
 - **The box in the middle of the screen between plays** (built-in
   widescreen, worst at 21:9): full-screen fills now cover the whole picture.
   A short darkening can still show as a box now and then; we are on it.
