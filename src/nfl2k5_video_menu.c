@@ -653,7 +653,7 @@ static void ml_text(int v, char *out, size_t n)
  * others end in "...". */
 static void ml_fit(char *t, int selected, DWORD now)
 {
-    int len = (int)strlen(t), w = s_ml.width;
+    int len = (int)strlen(t), w = selected ? s_ml.width : s_ml.width + 8;   /* the selected row's letters are bigger */
     if (len <= w) return;
     if (!selected) { strcpy(t + w - 3, "..."); return; }
     {
