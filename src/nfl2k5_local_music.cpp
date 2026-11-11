@@ -10,6 +10,9 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <wchar.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -17,6 +20,28 @@ extern "C" long nfl2k5_wma_transcode_utf8(const char *src, const char *dst);
 extern "C" int nfl2k5_asf_strip_tags_utf8(const char *path);
 
 namespace {
+
+/* Paths as UTF-8 and files opened by their real (wide) name. On Windows
+ * path::string() converts to the ANSI code page and THROWS for a name outside
+ * it (an accented or Japanese song name on an English system): in 0.8.0 that
+ * exception left the music thread and the game closed at boot (0xC0000409). */
+static std::string u8(const fs::path &p)
+{
+    return p.u8string();   /* C++17: UTF-8 in a std::string, from the wide name; no code page */
+}
+
+static FILE *open_path(const fs::path &p, const char *mode)
+{
+#ifdef _WIN32
+    wchar_t wm[8];
+    size_t i = 0;
+    for (; mode[i] && i + 1 < 8; i++) wm[i] = (wchar_t)mode[i];
+    wm[i] = 0;
+    return _wfopen(p.c_str(), wm);
+#else
+    return fopen(p.c_str(), mode);
+#endif
+}
 
 struct Song {
     fs::path src, cache;
@@ -75,7 +100,7 @@ static std::u16string u8_to_u16(const std::string &s)
 static bool is_audio(const fs::path &p)
 {
     static const char *const exts[] = { ".mp3", ".wma", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".mp4" };
-    std::string ext = p.extension().string();
+    std::string ext = u8(p.extension());
     for (char &c : ext) c = (char)std::tolower((unsigned char)c);
     for (const char *x : exts) {
         if (ext == x) return true;
@@ -86,8 +111,8 @@ static bool is_audio(const fs::path &p)
 // Natural sort ("2 Track" before "10 Track") replacing StrCmpLogicalW
 static bool natural_less(const fs::path &pa, const fs::path &pb)
 {
-    std::string a = pa.filename().string();
-    std::string b = pb.filename().string();
+    std::string a = u8(pa.filename());
+    std::string b = u8(pb.filename());
     size_t ia = 0, ib = 0;
     while (ia < a.size() && ib < b.size()) {
         if (std::isdigit((unsigned char)a[ia]) && std::isdigit((unsigned char)b[ib])) {
@@ -106,20 +131,33 @@ static bool natural_less(const fs::path &pa, const fs::path &pb)
     return a.size() < b.size();
 }
 
+/* A folder's entries; never throws (an unreadable folder or entry is logged and left out). */
 static std::vector<fs::path> list(const fs::path &dir, bool want_dirs)
 {
     std::vector<fs::path> out;
     std::error_code ec;
-    if (!fs::exists(dir, ec)) return out;
-    for (const auto &entry : fs::directory_iterator(dir, ec)) {
-        std::string name = entry.path().filename().string();
-        if (name.empty() || name[0] == '.') continue;
-        bool is_d = entry.is_directory(ec);
-        if (is_d != want_dirs) continue;
-        if (want_dirs || is_audio(entry.path()))
-            out.push_back(entry.path());
+    try {
+        if (!fs::exists(dir, ec)) return out;
+        fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::error_code e2;
+            const fs::path &p = it->path();
+            std::string name = u8(p.filename());
+            if (name.empty() || name[0] == '.') continue;
+            bool is_d = it->is_directory(e2);
+            if (e2 || is_d != want_dirs) continue;
+            if (want_dirs || is_audio(p))
+                out.push_back(p);
+        }
+        if (ec)
+            fprintf(stderr, "[MUSIC] could not read all of folder %s (%s); using what was read\n",
+                    u8(dir).c_str(), ec.message().c_str());
+        std::sort(out.begin(), out.end(), natural_less);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[MUSIC] skipped folder %s: %s\n", u8(dir).c_str(), e.what());
+    } catch (...) {
+        fprintf(stderr, "[MUSIC] skipped folder %s\n", u8(dir).c_str());
     }
-    std::sort(out.begin(), out.end(), natural_less);
     return out;
 }
 
@@ -136,7 +174,7 @@ static std::string strip_track_prefix(std::string t)
 
 static std::u16string title_from_name(const fs::path &file)
 {
-    std::string t = strip_track_prefix(file.stem().string());
+    std::string t = strip_track_prefix(u8(file.stem()));
     size_t dash = t.find(" - ");
     if (dash != std::string::npos) t = t.substr(dash + 3);
     return u8_to_u16(t);
@@ -144,7 +182,7 @@ static std::u16string title_from_name(const fs::path &file)
 
 static std::u16string artist_from_name(const fs::path &file)
 {
-    std::string t = strip_track_prefix(file.stem().string());
+    std::string t = strip_track_prefix(u8(file.stem()));
     size_t dash = t.find(" - ");
     return dash == std::string::npos ? u"" : u8_to_u16(t.substr(0, dash));
 }
@@ -156,7 +194,7 @@ static uint32_t read_asf_duration_ms(const fs::path &wma_path)
         0xA1,0xDC,0xAB,0x8C,0x47,0xA9,0xCF,0x11,
         0x8E,0xE4,0x00,0xC0,0x0C,0x20,0x53,0x65
     };
-    FILE *f = fopen(wma_path.string().c_str(), "rb");
+    FILE *f = open_path(wma_path, "rb");
     if (!f) return 0;
 
     uint8_t buf[4096];
@@ -191,7 +229,8 @@ static void read_tags(Song &s)
 {
     s.title = title_from_name(s.src);
     s.artist = artist_from_name(s.src);
-    if (fs::exists(s.cache))
+    std::error_code ec;
+    if (fs::exists(s.cache, ec))
         s.ms = read_asf_duration_ms(s.cache);
 }
 
@@ -209,7 +248,7 @@ static fs::path cache_name(const fs::path &src)
             h *= 1099511628211ull;
         }
     };
-    std::string lower = src.string();
+    std::string lower = u8(src);
     for (char &c : lower) c = (char)std::tolower((unsigned char)c);
     mix(lower.data(), lower.size());
     mix(&fsize, sizeof fsize);
@@ -274,8 +313,11 @@ static void write_db()
     for (auto &g : groups) db.insert(db.end(), g.begin(), g.end());
 
     fs::path tmp = g_out / "ST.DB.new", dst = g_out / "ST.DB";
-    FILE *f = fopen(tmp.string().c_str(), "wb");
-    if (!f) return;
+    FILE *f = open_path(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "[MUSIC] could not write %s\n", u8(tmp).c_str());
+        return;
+    }
     fwrite(db.data(), 1, db.size(), f);
     fclose(f);
 
@@ -289,7 +331,7 @@ static void write_db()
 
 static void link_song(size_t a, size_t k)
 {
-    std::string cache_str = g_albums[a].songs[k].cache.string();
+    std::string cache_str = u8(g_albums[a].songs[k].cache);
     nfl2k5_asf_strip_tags_utf8(cache_str.c_str());
 
     char dir_buf[32], file_buf[32];
@@ -307,12 +349,61 @@ static void link_song(size_t a, size_t k)
     }
 }
 
-static int SDLCALL worker(void *)
+/* One playlist per folder that holds songs: Music\<folder>, its sub-folders
+ * too (named "folder / sub", up to 3 levels down), and songs left loose in
+ * Music itself ("Music"). */
+static void collect_albums(const fs::path &dir, const std::string &name, int depth, size_t &total, size_t &todo)
+{
+    if (SDL_GetAtomicInt(&g_music_stop) || g_albums.size() >= 100) return;
+    std::error_code ec;
+    Album al;
+    al.name = u8_to_u16(name);
+    for (const fs::path &f : list(dir, false)) {
+        if (SDL_GetAtomicInt(&g_music_stop)) break;
+        try {
+            Song s;
+            s.src = f;
+            s.cache = cache_name(s.src);
+            s.ready = fs::exists(s.cache, ec);
+            read_tags(s);
+            if (!s.ready) todo++;
+            al.songs.push_back(s);
+            total++;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "[MUSIC] skipped %s: %s\n", u8(f).c_str(), e.what());
+        } catch (...) {
+            fprintf(stderr, "[MUSIC] skipped %s\n", u8(f).c_str());
+        }
+    }
+    if (!al.songs.empty()) g_albums.push_back(al);
+    if (depth >= 3) return;
+    for (const fs::path &d : list(dir, true)) {
+        std::string sub = u8(d.filename());
+        collect_albums(d, name.empty() ? sub : name + " / " + sub, depth + 1, total, todo);
+    }
+}
+
+/* A song the converter refused once is not tried again at every start
+ * (cache\<id>.bad); it is retried when the file changes (a new id). */
+static fs::path bad_marker(const Song &s)
+{
+    fs::path b = s.cache;
+    b.replace_extension(".bad");
+    return b;
+}
+
+static int SDLCALL worker_body(void *)
 {
     SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
-    size_t total = 0, todo = 0;
+    size_t total = 0, todo = 0, failed = 0, skipped_bad = 0;
     std::error_code ec;
-    std::vector<fs::path> album_dirs = list(g_music, true);
+    {   /* songs loose in Music itself */
+        size_t before = g_albums.size();
+        collect_albums(g_music, "", 3, total, todo);
+        if (g_albums.size() > before) g_albums.back().name = u"Music";
+    }
+    for (const fs::path &d : list(g_music, true))
+        collect_albums(d, u8(d.filename()), 1, total, todo);
 #ifdef NFL2K5_UWP
     /* UWP/Xbox: more song folders (LocalState\Music, a USB folder named in
      * LocalState\music.txt), ';'-separated UTF-8, from uwp_game.cpp. */
@@ -324,29 +415,13 @@ static int SDLCALL worker(void *)
             if (e > p) {
                 fs::path more = fs::u8path(all.substr(p, e - p));
                 if (!fs::equivalent(more, g_music, ec))
-                    for (const fs::path &d : list(more, true)) album_dirs.push_back(d);
+                    for (const fs::path &d : list(more, true))
+                        collect_albums(d, u8(d.filename()), 1, total, todo);
             }
             p = e + 1;
         }
     }
 #endif
-    for (const fs::path &dir : album_dirs) {
-        if (SDL_GetAtomicInt(&g_music_stop)) break;
-        Album al;
-        al.name = u8_to_u16(dir.filename().string());
-        for (const fs::path &f : list(dir, false)) {
-            if (SDL_GetAtomicInt(&g_music_stop)) break;
-            Song s;
-            s.src = f;
-            s.cache = cache_name(s.src);
-            s.ready = fs::exists(s.cache, ec);
-            read_tags(s);
-            if (!s.ready) todo++;
-            al.songs.push_back(s);
-            total++;
-        }
-        if (!al.songs.empty()) g_albums.push_back(al);
-    }
     fprintf(stderr, "[MUSIC] library: %zu playlists, %zu songs, %zu to convert\n", g_albums.size(), total, todo);
     /* Publish only after all Album/Song entries have been appended. */
     SDL_SetAtomicInt(&g_music_ready, 1);
@@ -363,13 +438,19 @@ static int SDLCALL worker(void *)
             if (SDL_GetAtomicInt(&g_music_stop)) break;
             Song &s = g_albums[a].songs[k];
             if (s.ready) continue;
+            if (fs::exists(bad_marker(s), ec)) { skipped_bad++; continue; }
             fs::path part = s.cache;
             part.replace_extension(".part.wma");
-            long r = nfl2k5_wma_transcode_utf8(s.src.string().c_str(), part.string().c_str());
-            fs::rename(part, s.cache, ec);
+            std::error_code fsz;
+            long r = fs::file_size(s.src, fsz) == 0 && !fsz ? -2 : nfl2k5_wma_transcode_utf8(u8(s.src).c_str(), u8(part).c_str());
+            if (!r) fs::rename(part, s.cache, ec);
             if (r || ec) {
-                fprintf(stderr, "[MUSIC] could not convert %s (0x%08lX)\n", s.src.string().c_str(), (unsigned long)r);
+                fprintf(stderr, "[MUSIC] skipped %s: %s (0x%08lX); fix or remove the file, the game plays the rest\n",
+                        u8(s.src).c_str(), r == -2 ? "empty file" : r ? "not a song the converter can read" : "could not keep the converted copy",
+                        (unsigned long)r);
                 fs::remove(part, ec);
+                if (FILE *m = open_path(bad_marker(s), "wb")) fclose(m);
+                failed++;
                 continue;
             }
             if (!s.ms) s.ms = read_asf_duration_ms(s.cache);
@@ -378,7 +459,22 @@ static int SDLCALL worker(void *)
             write_db();
         }
     }
-    fprintf(stderr, "[MUSIC] library ready\n");
+    fprintf(stderr, "[MUSIC] library ready (%zu skipped as unreadable, %zu skipped from earlier runs)\n", failed, skipped_bad);
+    return 0;
+}
+
+/* Nothing in the music library may stop the game: whatever goes wrong in the
+ * scan is logged, the songs read so far stay, and the game starts anyway. */
+static int SDLCALL worker(void *arg)
+{
+    try {
+        return worker_body(arg);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[MUSIC] library scan stopped: %s (the game goes on without the rest)\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "[MUSIC] library scan stopped by an unknown error (the game goes on without the rest)\n");
+    }
+    SDL_SetAtomicInt(&g_music_ready, 1);
     return 0;
 }
 
@@ -1086,7 +1182,9 @@ extern "C" void xbox_MenuAddPage(const void *page);
 
 static SDL_AtomicInt g_pick_request;   /* 0 none, else 1 + source */
 static SDL_AtomicInt g_pick_song;      /* 0 all songs, else 1 + song */
-static int g_ui_source, g_ui_song;
+static SDL_AtomicInt g_pick_shuffle;   /* the folder plays in a shuffled order */
+static SDL_AtomicInt g_prev_request;   /* Previous song */
+static int g_ui_source;
 static int g_pick_row = -1, g_pick_wait, g_pick_hold;
 static bool g_pick_told;
 extern "C" void xbox_PresentToast(const char *header, const char *line1, const char *line2, unsigned ms);
@@ -1111,13 +1209,29 @@ static std::vector<size_t> folder_songs(size_t a)
     return out;
 }
 
-static void text_of(const std::u16string &s, char *out, size_t n)
+/* The menu font has ASCII only: accented Latin letters lose the accent
+ * ("Beyonce"), anything else shows as '?'. */
+static char ascii_of(char16_t c)
 {
-    size_t i = 0;
-    if (n > 49) n = 49;                /* the row's value column */
-    for (; i < s.size() && i + 1 < n; i++) out[i] = s[i] < 0x80 ? (char)s[i] : '?';
-    out[i] = 0;
-    if (i < s.size() && i > 3) strcpy(out + i - 3, "...");
+    static const char latin1[] =                     /* U+00C0..U+00FF */
+        "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYTs" "aaaaaaaceeeeiiii" "dnooooo/ouuuuyty";
+    if (c < 0x80) return (char)c;
+    if (c >= 0xC0 && c <= 0xFF) return latin1[c - 0xC0];
+    if (c == 0x2019 || c == 0x2018) return '\'';
+    if (c == 0x2013 || c == 0x2014) return '-';
+    return '?';
+}
+
+/* A name in the menu font: the whole name, for a row that truncates or
+ * scrolls it itself. A pair of surrogates is one '?'. */
+static void text_full(const std::u16string &s, char *out, size_t n)
+{
+    size_t i = 0, o = 0;
+    for (; i < s.size() && o + 1 < n; i++) {
+        if (s[i] >= 0xDC00 && s[i] <= 0xDFFF) continue;
+        out[o++] = ascii_of(s[i]);
+    }
+    if (n) out[o] = 0;
 }
 
 static void music_guest_call(void (*fn)(void), uint32_t ecx)
@@ -1128,8 +1242,11 @@ static void music_guest_call(void (*fn)(void), uint32_t ecx)
     fn();
 }
 
+extern "C" void nfl2k5_music_list_service(void);
+
 extern "C" void nfl2k5_music_frame_service(void)
 {
+    nfl2k5_music_list_service();       /* Options > Music Player: its cursor sound (src/nfl2k5_video_menu.c) */
     /* In a match, the attract demo or the title there is no menu music to
      * replace, and starting a song there is lost or starts nothing: a pick
      * waits for the menus, Next song is dropped. The Main Menu stays on the
@@ -1155,6 +1272,8 @@ extern "C" void nfl2k5_music_frame_service(void)
     if (!under_main_menu || match_screen) {
         if (SDL_SetAtomicInt(&g_skip_request, 0))
             xbox_PresentToast("MUSIC PLAYER", "Next song works in the menus", "", 3000);
+        if (SDL_SetAtomicInt(&g_prev_request, 0))
+            xbox_PresentToast("MUSIC PLAYER", "Previous song works in the menus", "", 3000);
         if (SDL_GetAtomicInt(&g_pick_request) && !g_pick_told) {
             g_pick_told = true;
             xbox_PresentToast("MUSIC PLAYER", "Your pick plays back in the menus", "", 3000);
@@ -1200,6 +1319,31 @@ extern "C" void nfl2k5_music_frame_service(void)
             nfl2k5_local_music_buttons(0, 0);
         }
     }
+    if (SDL_SetAtomicInt(&g_prev_request, 0)) {
+        uint32_t entry = g32(0xC3CBFCu), first = g32(0xC3CBF8u), p = entry, prev = 0;
+        /* a playlist song: the entry whose next is this one (the F1 ring and
+         * the Jukebox list both chain through +0x10; the list ends at 0xC3CBE8) */
+        if (SDL_GetAtomicInt(&g_cur_id) >= 0 && entry && entry != 0xC3CBE8u) {
+            for (int i = 0; i < 1200 && p && p < 0x08000000u; i++) {
+                uint32_t n = g32(p + 0x10u);
+                if (n == 0xC3CBE8u || !n) n = first;
+                if (n == entry) { prev = p; break; }
+                p = n;
+            }
+        }
+        if (prev) {
+            uint32_t keep_eax = g_eax, keep_ebx = g_ebx, keep_esi = g_esi, keep_ecx = g_ecx, keep_edx = g_edx;
+            g32(0xC3CBFCu) = prev;
+            fprintf(stderr, "[MUSIC] Music Player: previous entry %08X\n", prev);
+            music_guest_call(sub_0027FEC0, 0);
+            g_pick_row = 1;
+            g_pick_wait = 0;
+            g_pick_hold = 45;
+            g_eax = keep_eax; g_ebx = keep_ebx; g_esi = keep_esi; g_ecx = keep_ecx; g_edx = keep_edx;
+        } else {
+            xbox_PresentToast("MUSIC PLAYER", "Previous song is for your own songs", "the game's music only goes forward", 3000);
+        }
+    }
     int request = SDL_SetAtomicInt(&g_pick_request, 0);
     if (!request) return;
     int source = request - 1, song = SDL_GetAtomicInt(&g_pick_song);
@@ -1229,6 +1373,20 @@ extern "C" void nfl2k5_music_frame_service(void)
         if (songs.empty()) return;
         if (!g_pick_nodes) g_pick_nodes = xbox_HeapAlloc(kPickNode * kMaxPick, 16);
         if (!g_pick_nodes) return;
+        /* the order the ring plays in: the folder's, or shuffled (the picked
+         * song, if any, first) */
+        size_t start = song > 0 && (size_t)(song - 1) < songs.size() ? (size_t)(song - 1) : 0;
+        std::vector<size_t> order(songs.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (start + i) % order.size();
+        if (SDL_GetAtomicInt(&g_pick_shuffle)) {
+            uint64_t r = SDL_GetPerformanceCounter() | 1u;
+            for (size_t i = order.size() - 1; i > 0; i--) {
+                r ^= r << 13; r ^= r >> 7; r ^= r << 17;   /* xorshift64 */
+                std::swap(order[i], order[(size_t)(r % (i + 1))]);
+            }
+            if (song > 0)
+                std::swap(order[0], *std::find(order.begin(), order.end(), start));
+        }
         for (size_t i = 0; i < songs.size(); i++) {
             uint32_t node = g_pick_nodes + (uint32_t)i * kPickNode;
             for (uint32_t o = 0; o < kPickNode; o += 4) g32(node + o) = 0;
@@ -1237,13 +1395,16 @@ extern "C" void nfl2k5_music_frame_service(void)
             g_edx = (uint32_t)i;                             /* +8: the name check 0x27FF90 compares */
             music_guest_call(sub_0027F550, g32(node + 0x00));
             g32(node + 0x08) = g_eax;
-            g32(node + 0x10) = g_pick_nodes + (uint32_t)((i + 1) % songs.size()) * kPickNode;
         }
-        cur = g_pick_nodes + (uint32_t)(song > 0 && (size_t)(song - 1) < songs.size() ? song - 1 : 0) * kPickNode;
+        for (size_t j = 0; j < order.size(); j++)
+            g32(g_pick_nodes + (uint32_t)order[j] * kPickNode + 0x10u) =
+                g_pick_nodes + (uint32_t)order[(j + 1) % order.size()] * kPickNode;
+        cur = g_pick_nodes + (uint32_t)order[0] * kPickNode;
     }
     if (row) { g32(0xB9E298u) = 1; g32(0xB9E29Cu) = 1; }     /* Crib Music: Crib/Menus for now */
     if (cur) g32(0xC3CBFCu) = cur;
-    fprintf(stderr, "[MUSIC] F1 Music Player: source %d song %d, entry %08X, row %u\n", source, song, cur, row);
+    fprintf(stderr, "[MUSIC] Music Player: source %d song %d%s, entry %08X, row %u\n", source, song,
+            source >= 2 && SDL_GetAtomicInt(&g_pick_shuffle) ? " (shuffled)" : "", cur, row);
     music_guest_call(sub_0027FEC0, 0);                       /* stop what plays */
     g_pick_row = (int)row;                                   /* and start when the player has let go */
     g_pick_wait = 0;
@@ -1261,7 +1422,7 @@ static void now_playing_text(char *out, size_t n)
         std::u16string line = s.title;
         const std::u16string &by = s.artist.empty() ? g_albums[a].name : s.artist;
         if (!by.empty()) line += u" - " + by;
-        text_of(line, out, n);
+        text_full(line, out, n);
     } else if (retail_current(bank, mode, index)) {
         if (bank == RETAIL_CRIB) snprintf(out, n, "%s - %s", g_crib_tracks[index].title, g_crib_tracks[index].artist);
         else snprintf(out, n, "Original Menu Music %02u", index + 1);
@@ -1270,62 +1431,154 @@ static void now_playing_text(char *out, size_t n)
     }
 }
 
-enum { MP_NOW, MP_NEXT, MP_SOURCE, MP_SONG, MP_PLAY, MP_ROWS };
+/* ── The song list (2026-11-10) ─────────────────────────────────────────────
+ * "fix the song player to where i dont have to skip them one by one but
+ * instead scroll threw": every song of a playlist is a row, picked straight
+ * away. Two views use it: Options > Music Player, a list in the game's own
+ * menu style (src/nfl2k5_video_menu.c, every platform), and the F1 page below
+ * (Windows, Linux). Sources: 0 the game's music, 1 the VIP's Jukebox playlist,
+ * 2.. each Music folder with converted songs. A pick made outside the menus
+ * waits for them, as before (nfl2k5_music_frame_service). */
+extern "C" int nfl2k5_music_source_count(void) { return (int)music_folders().size() + 2; }
+
+extern "C" void nfl2k5_music_source_name(int source, char *out, size_t n)
+{
+    std::vector<size_t> folders = music_folders();
+    if (!n) return;
+    out[0] = 0;
+    if (source == 0) snprintf(out, n, "Game music");
+    else if (source == 1) snprintf(out, n, "Jukebox playlist");
+    else if (source >= 2 && (size_t)(source - 2) < folders.size()) text_full(g_albums[folders[(size_t)(source - 2)]].name, out, n);
+}
+
+/* Songs listed for a source: a folder's converted songs; none for the game's
+ * music and the Jukebox (they play as a whole). */
+extern "C" int nfl2k5_music_song_count(int source)
+{
+    std::vector<size_t> folders = music_folders();
+    if (source < 2 || (size_t)(source - 2) >= folders.size()) return 0;
+    return (int)folder_songs(folders[(size_t)(source - 2)]).size();
+}
+
+/* "Title - Artist" of song `song` of a folder (the folder's name when the
+ * file names no artist would only repeat the playlist: left out). */
+extern "C" void nfl2k5_music_song_text(int source, int song, char *out, size_t n)
+{
+    std::vector<size_t> folders = music_folders();
+    if (!n) return;
+    out[0] = 0;
+    if (source < 2 || (size_t)(source - 2) >= folders.size()) return;
+    size_t a = folders[(size_t)(source - 2)];
+    std::vector<size_t> songs = folder_songs(a);
+    if (song < 0 || (size_t)song >= songs.size()) return;
+    const Song &s = g_albums[a].songs[songs[(size_t)song]];
+    std::u16string line = s.title;
+    if (!s.artist.empty()) line += u" - " + s.artist;
+    text_full(line, out, n);
+}
+
+/* The custom song playing now as (source, song), 1; 0 when none (the game's
+ * own music, or nothing). */
+extern "C" int nfl2k5_music_now(int *source, int *song)
+{
+    int cur = SDL_GetAtomicInt(&g_cur_id);
+    if (cur < 0 || !SDL_GetAtomicInt(&g_music_ready)) return 0;
+    size_t a = (size_t)cur >> 16, k = (size_t)cur & 0xFFFF;
+    std::vector<size_t> folders = music_folders();
+    for (size_t f = 0; f < folders.size(); f++) {
+        if (folders[f] != a) continue;
+        std::vector<size_t> songs = folder_songs(a);
+        for (size_t i = 0; i < songs.size(); i++)
+            if (songs[i] == k) { *source = (int)f + 2; *song = (int)i; return 1; }
+    }
+    return 0;
+}
+
+extern "C" void nfl2k5_music_now_text(char *out, size_t n) { now_playing_text(out, n); }
+
+/* Play a source: song < 0 from its first song (or the source as a whole),
+ * else that song and on from it; shuffle plays a folder in a random order. */
+extern "C" void nfl2k5_music_play(int source, int song, int shuffle)
+{
+    if (source < 0 || source >= nfl2k5_music_source_count()) return;
+    SDL_SetAtomicInt(&g_pick_shuffle, shuffle && source >= 2);
+    SDL_SetAtomicInt(&g_pick_song, source >= 2 && song >= 0 ? song + 1 : 0);
+    SDL_SetAtomicInt(&g_pick_request, source + 1);
+    fprintf(stderr, "[MUSIC] Music Player pick: source %d song %d%s\n", source, song, shuffle ? " shuffle" : "");
+    xbox_MenuInvalidate();
+}
+
+/* Next (dir > 0) or previous song. */
+extern "C" void nfl2k5_music_skip(int dir)
+{
+    SDL_SetAtomicInt(dir < 0 ? &g_prev_request : &g_skip_request, 1);
+    xbox_MenuInvalidate();
+}
+
+/* ── F1 > Music Player ──────────────────────────────────────────────────────
+ * Now playing, Next, Previous, the playlist (Left/Right on any row changes
+ * it), Play all, Shuffle, then one row per song; the F1 page scrolls a long
+ * page itself (nv2a_gpu_present.inc.c: LT/RT or Home/End jump a page). */
+enum { MP_NOW, MP_NEXT, MP_PREV, MP_SOURCE, MP_PLAY, MP_SHUFFLE, MP_SONGS };
+
+static void mp_fit(char *s, size_t width)
+{
+    if (strlen(s) > width && width > 3) strcpy(s + width - 3, "...");
+}
 
 static void mp_label(int row, char *name, char *val, size_t n)
 {
-    std::vector<size_t> folders = music_folders();
+    char text[160];
+    int count = nfl2k5_music_source_count(), now_src = -1, now_song = -1;
     val[0] = 0;
-    if (g_ui_source >= (int)folders.size() + 2) g_ui_source = 0;
+    name[0] = 0;
+    if (g_ui_source >= count) g_ui_source = 0;
     switch (row) {
-    case MP_NOW: strcpy(name, "Now playing"); now_playing_text(val, n); break;
+    case MP_NOW: strcpy(name, "Now playing"); now_playing_text(text, sizeof text); mp_fit(text, 40); snprintf(val, n, "%s", text); break;
     case MP_NEXT: strcpy(name, "Next song"); break;
+    case MP_PREV: strcpy(name, "Previous song"); break;
     case MP_SOURCE:
         strcpy(name, "Playlist");
-        if (g_ui_source == 0) snprintf(val, n, "Game music");
-        else if (g_ui_source == 1) snprintf(val, n, "Jukebox playlist");
-        else text_of(g_albums[folders[(size_t)(g_ui_source - 2)]].name, val, n);
+        nfl2k5_music_source_name(g_ui_source, text, sizeof text);
+        mp_fit(text, 34);
+        if (g_ui_source >= 2) snprintf(val, n, "%s (%d)", text, nfl2k5_music_song_count(g_ui_source));
+        else snprintf(val, n, "%s", text);
         break;
-    case MP_SONG:
-        strcpy(name, "Song");
-        if (g_ui_source < 2 || g_ui_song == 0) snprintf(val, n, "All songs");
-        else {
-            size_t a = folders[(size_t)(g_ui_source - 2)];
-            std::vector<size_t> songs = folder_songs(a);
-            if ((size_t)(g_ui_song - 1) < songs.size()) text_of(g_albums[a].songs[songs[(size_t)(g_ui_song - 1)]].title, val, n);
+    case MP_PLAY: strcpy(name, g_ui_source >= 2 ? "Play all" : "Play"); break;
+    case MP_SHUFFLE: strcpy(name, "Shuffle"); if (g_ui_source < 2) snprintf(val, n, "your folders"); break;
+    default:
+        if (row >= MP_SONGS) {
+            nfl2k5_music_song_text(g_ui_source, row - MP_SONGS, text, sizeof text);
+            mp_fit(text, 44);
+            snprintf(name, 64, "%3d. %s", row - MP_SONGS + 1, text);
+            if (nfl2k5_music_now(&now_src, &now_song) && now_src == g_ui_source && now_song == row - MP_SONGS)
+                snprintf(val, n, "playing");
         }
         break;
-    case MP_PLAY: strcpy(name, "Play"); break;
-    default: name[0] = 0; break;
     }
 }
 
 static void mp_change(int row, int dir)
 {
-    std::vector<size_t> folders = music_folders();
-    if (row == MP_SOURCE) {
-        int count = (int)folders.size() + 2;
-        g_ui_source = (g_ui_source + count + dir) % count;
-        g_ui_song = 0;
-    } else if (row == MP_SONG && g_ui_source >= 2 && (size_t)(g_ui_source - 2) < folders.size()) {
-        int count = (int)folder_songs(folders[(size_t)(g_ui_source - 2)]).size() + 1;
-        g_ui_song = (g_ui_song + count + dir) % count;
-    }
+    int count = nfl2k5_music_source_count();
+    (void)row;
+    g_ui_source = (g_ui_source + count + dir) % count;      /* Left/Right on any row: the playlist */
     xbox_MenuInvalidate();
 }
 
 static void mp_activate(int row)
 {
     if (row < 0) return;
-    if (row == MP_NEXT) SDL_SetAtomicInt(&g_skip_request, 1);
-    else if (row == MP_PLAY) {
-        SDL_SetAtomicInt(&g_pick_song, g_ui_song);
-        SDL_SetAtomicInt(&g_pick_request, g_ui_source + 1);
-    } else mp_change(row, 1);
+    if (row == MP_NEXT) nfl2k5_music_skip(1);
+    else if (row == MP_PREV) nfl2k5_music_skip(-1);
+    else if (row == MP_SOURCE) mp_change(row, 1);
+    else if (row == MP_PLAY) nfl2k5_music_play(g_ui_source, -1, 0);
+    else if (row == MP_SHUFFLE) { if (g_ui_source >= 2) nfl2k5_music_play(g_ui_source, -1, 1); }
+    else if (row >= MP_SONGS) nfl2k5_music_play(g_ui_source, row - MP_SONGS, 0);
     xbox_MenuInvalidate();
 }
 
-static int mp_count(void) { return MP_ROWS; }
+static int mp_count(void) { return MP_SONGS + nfl2k5_music_song_count(g_ui_source); }
 
 /* xbox_MenuAddPage's XboxMenuPage (nv2a_gpu_present.inc.c) */
 static const struct {
@@ -1340,51 +1593,4 @@ static const struct {
 extern "C" void nfl2k5_music_player_init(void)
 {
     xbox_MenuAddPage(&k_music_page);
-}
-
-/* The same page as rows of the game's own menus (Options > Music Player,
- * src/nfl2k5_video_menu.c), where there is no F1 menu to show it. */
-static int mp_values(int row)
-{
-    std::vector<size_t> folders = music_folders();
-    if (row == MP_SOURCE) return (int)folders.size() + 2;
-    if (row == MP_SONG && g_ui_source >= 2 && (size_t)(g_ui_source - 2) < folders.size())
-        return (int)folder_songs(folders[(size_t)(g_ui_source - 2)]).size() + 1;
-    if (row == MP_NEXT || row == MP_PLAY) return 2;     /* an action: any change fires it */
-    return 1;
-}
-
-extern "C" int nfl2k5_music_rows(void) { return MP_ROWS; }
-extern "C" const char *nfl2k5_music_row_label(int row)
-{
-    static const char *const k_names[MP_ROWS] = { "Now Playing", "Next Song", "Playlist", "Song", "Play" };
-    return row >= 0 && row < MP_ROWS ? k_names[row] : "";
-}
-extern "C" int nfl2k5_music_row_toggle(int row) { (void)row; return 0; }
-extern "C" int nfl2k5_music_row_values(int row) { return mp_values(row); }
-extern "C" int nfl2k5_music_row_get(int row)
-{
-    return row == MP_SOURCE ? g_ui_source : row == MP_SONG ? g_ui_song : 0;
-}
-extern "C" void nfl2k5_music_row_set(int row, int value)
-{
-    if (row == MP_SOURCE) { g_ui_source = value; g_ui_song = 0; }
-    else if (row == MP_SONG) g_ui_song = value;
-    else if (row == MP_NEXT || row == MP_PLAY) mp_activate(row);
-}
-extern "C" void nfl2k5_music_row_name(int row, int value, char *out, size_t n)
-{
-    char name[32];
-    int source = g_ui_source, song = g_ui_song;
-    out[0] = 0;
-    if (row == MP_NEXT) { snprintf(out, n, "Skip"); return; }
-    if (row == MP_PLAY) { snprintf(out, n, "Start"); return; }
-    /* mp_label names the current choice; the menu also asks for every value */
-    if (row == MP_SOURCE) g_ui_source = value;
-    else if (row == MP_SONG) g_ui_song = value;
-    mp_label(row, name, out, n);
-    g_ui_source = source;
-    g_ui_song = song;
-    /* wider than this and the screen draws a sideways scroll bar and no values */
-    if (strlen(out) > 30 && n > 30) strcpy(out + 27, "...");
 }

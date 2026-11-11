@@ -23,6 +23,7 @@
 #include <windows.h>
 #include "xbox_memory_layout.h"
 #include "recomp_funcs.h"
+#include "xinput_xbox.h"
 
 extern uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 extern void xbox_VideoSettingsLoad(void);
@@ -216,10 +217,6 @@ static void phone_name(int r, int v, char *b, size_t n) { nfl2k5_phone_value_nam
 static const char *s_phone_labels[VM_MAX_ROWS];
 #endif
 
-/* NFL2K5_MENU_MUSIC_ROWS: Android; a Linux test build can define it too */
-#if defined(__ANDROID__) && !defined(NFL2K5_MENU_MUSIC_ROWS)
-#define NFL2K5_MENU_MUSIC_ROWS 1
-#endif
 /* NFL2K5_MENU_GPU_ROWS: Android; a Linux test build can define it too */
 #if defined(__ANDROID__) && !defined(NFL2K5_MENU_GPU_ROWS)
 #define NFL2K5_MENU_GPU_ROWS 1
@@ -236,18 +233,6 @@ extern void nfl2k5_gpu_row_name(int r, int v, char *b, size_t n);
 static const char *s_gpu_labels[VM_MAX_ROWS];
 #endif
 
-#ifdef NFL2K5_MENU_MUSIC_ROWS
-/* ---- Music Player rows (src/nfl2k5_local_music.cpp): F1 > Music Player, for
- * a device with no F1 menu ---- */
-extern int nfl2k5_music_rows(void);
-extern const char *nfl2k5_music_row_label(int r);
-extern int nfl2k5_music_row_toggle(int r);
-extern int nfl2k5_music_row_values(int r);
-extern int nfl2k5_music_row_get(int r);
-extern void nfl2k5_music_row_set(int r, int v);
-extern void nfl2k5_music_row_name(int r, int v, char *b, size_t n);
-static const char *s_music_labels[VM_MAX_ROWS];
-#endif
 
 /* ---- Controls rows (src/nfl2k5_controls.c): vibration, dead zones, prompts,
  * button remapping ---- */
@@ -341,20 +326,20 @@ static VmScreen s_screens[] = {
     { "Phone Settings", 0, s_phone_labels, nfl2k5_phone_toggle, nfl2k5_phone_values, nfl2k5_phone_get, nfl2k5_phone_set, phone_name },
 #endif
 #ifdef NFL2K5_MENU_GPU_ROWS
-    /* keep before Music Player: VM_GPU */
+    /* keep next to last: VM_GPU */
     { "GPU Driver", 0, s_gpu_labels, nfl2k5_gpu_row_toggle, nfl2k5_gpu_row_values, nfl2k5_gpu_row_get, nfl2k5_gpu_row_set, nfl2k5_gpu_row_name },
-#endif
-#ifdef NFL2K5_MENU_MUSIC_ROWS
-    /* keep next to last: VM_MUSIC */
-    { "Music Player", 0, s_music_labels, nfl2k5_music_row_toggle, nfl2k5_music_row_values, nfl2k5_music_row_get, nfl2k5_music_row_set, nfl2k5_music_row_name },
 #endif
     /* keep last: VM_CONTROLS */
     { "Controls", 0, s_ctl_labels, nfl2k5_ctlmenu_toggle, nfl2k5_ctlmenu_values, nfl2k5_ctlmenu_get, nfl2k5_ctlmenu_set, ctl_name },
 };
 #define VM_SCREENS ((int)(sizeof s_screens / sizeof s_screens[0]))
 #define VM_CONTROLS (VM_SCREENS - 1)
-#define VM_MUSIC (VM_SCREENS - 2)
-#define VM_GPU (VM_SCREENS - 3)
+#define VM_GPU (VM_SCREENS - 2)
+
+#define ML_FN_BASE 0xFEC0E000u   /* Music Player song list: + row * 0x40, the rows' A action */
+#define ML_ROWS    7             /* the rows a link list shows (layout "navigation") */
+static recomp_func_t ml_lookup(uint32_t address);
+static uint32_t ml_install(void);
 
 /* One function for every row slot: the lookup remembers which address the
  * game is calling. Plain `ret`, results in eax. Value strings are written
@@ -415,6 +400,7 @@ static void vm_row_fn(void)
 recomp_func_t nfl2k5_video_menu_lookup(uint32_t address)
 {
     uint32_t off = address - VM_FN_BASE, scr = off / 0x1000u;
+    if ((address & 0xFFFFF000u) == ML_FN_BASE) return ml_lookup(address);
     if (scr >= (uint32_t)VM_SCREENS || (off % 0x1000u) / 0x40u >= (uint32_t)s_screens[scr].rows ||
         (off % 0x40u) / 4u > 6u)
         return NULL;
@@ -570,6 +556,405 @@ static int vm_remove_links(uint32_t menu_header, const char *first, const char *
     return removed;
 }
 
+/* ---- Options > Music Player: the song list (2026-11-10) ---------------------
+ * "fix the song player to where i dont have to skip them one by one but
+ * instead scroll threw". A screen of the game's own link-list kind (a copy of
+ * the Features menu, as the Exit screen in src/nfl2k5_exit_menu.c) whose seven
+ * rows are a window onto a list of any length:
+ *
+ *   Playlist < name (songs) >   Left/Right, LT/RT (or A) change the playlist
+ *   Shuffle All                 (Play for the game's music and the Jukebox)
+ *   Next Song, Previous Song
+ *   1. Title - Artist ...       every song of the playlist; A plays it, and on
+ *
+ * The game draws the rows from label buffers rewritten here, so the list
+ * scrolls under a cursor kept here: the pad is read in the input layer before
+ * the game sees it (nfl2k5_music_list_input, from src/nfl2k5_input_hle.c), Up/
+ * Down move one row and repeat faster the longer they are held, LB/RB (Page Up/
+ * Page Down) a page, and the game's own cursor (the screen stack entry's
+ * selected row) is written to match. A, START and B stay the game's: A runs the
+ * row's type-9 action (ml_fn), B goes back. The playing song is marked with
+ * '>'; a name too long for the row scrolls while it is selected. The songs come
+ * from src/nfl2k5_local_music.cpp, which also carries out the pick: one made in
+ * a match waits for the menus, as before. */
+extern int nfl2k5_music_source_count(void);
+extern void nfl2k5_music_source_name(int source, char *out, size_t n);
+extern int nfl2k5_music_song_count(int source);
+extern void nfl2k5_music_song_text(int source, int song, char *out, size_t n);
+extern int nfl2k5_music_now(int *source, int *song);
+extern void nfl2k5_music_now_text(char *out, size_t n);
+extern void nfl2k5_music_play(int source, int song, int shuffle);
+extern void nfl2k5_music_skip(int dir);
+
+#define ML_FSM        0x00A84B18u   /* the front end's screen stack (the pause menu's too) */
+#define ML_CHARS      96            /* a row's label buffer, UTF-16 characters */
+#define ML_SND_SELECT 0x00E7FD70u   /* L"Ambient: Menu Select" (retail) */
+#define ML_SND_CURSOR 0x00E7FD3Cu   /* L"Ambient: Menu Move Cursor" (retail) */
+enum { ML_PLAYLIST, ML_SHUFFLE, ML_NEXT, ML_PREV, ML_FIXED };
+
+static struct {
+    uint32_t header, label[ML_ROWS], sub;
+    char shown[ML_ROWS][ML_CHARS], sub_shown[ML_CHARS];
+    int source, sel, top, count, active, opened_once, sounds, width;
+    uint16_t space;                  /* what a space is written as (see ml_put) */
+    uint32_t saved_sub, runtime;
+    int marquee_sel, marquee_pos;
+    DWORD marquee_at, refresh_at;
+    int sound;                       /* 1 cursor, played by nfl2k5_music_list_service */
+    WORD prev_buttons[4];
+    BYTE prev_analog[4][8];
+    int prev_sx[4];
+    int repeat_dir[4];
+    DWORD repeat_at[4], held_since[4];
+} s_ml;
+static RECOMP_TLS uint32_t s_ml_called;
+
+static int ml_depth(void)
+{
+    uint32_t d = MEM32(ML_FSM + 0x100u);
+    return d < 0x20u ? (int)d : -1;
+}
+
+static int ml_on_top(void)
+{
+    int d = ml_depth();
+    return s_ml.header && d >= 0 && MEM32(ML_FSM + (uint32_t)d * 8u) == s_ml.header;
+}
+
+int nfl2k5_music_list_active(void) { return s_ml.active && ml_on_top(); }
+
+static int ml_count(void) { return ML_FIXED + nfl2k5_music_song_count(s_ml.source); }
+
+static void ml_text(int v, char *out, size_t n)
+{
+    char name[ML_CHARS];
+    int ns = -1, ng = -1;
+    out[0] = 0;
+    if (v < 0 || v >= s_ml.count) return;
+    switch (v) {
+    case ML_PLAYLIST:
+        nfl2k5_music_source_name(s_ml.source, name, sizeof name);
+        if (s_ml.source >= 2) snprintf(out, n, "Playlist < %s (%d) >", name, s_ml.count - ML_FIXED);
+        else snprintf(out, n, "Playlist < %s >", name);
+        break;
+    case ML_SHUFFLE: snprintf(out, n, "%s", s_ml.source >= 2 ? "Shuffle All" : "Play"); break;
+    case ML_NEXT: snprintf(out, n, "Next Song"); break;
+    case ML_PREV: snprintf(out, n, "Previous Song"); break;
+    default:
+        nfl2k5_music_song_text(s_ml.source, v - ML_FIXED, name, sizeof name);
+        snprintf(out, n, "%s%d. %s",
+                 nfl2k5_music_now(&ns, &ng) && ns == s_ml.source && ng == v - ML_FIXED ? "> " : "",
+                 v - ML_FIXED + 1, name);
+        break;
+    }
+}
+
+/* The row's text in its width: a selected long name scrolls (after a pause),
+ * others end in "...". */
+static void ml_fit(char *t, int selected, DWORD now)
+{
+    int len = (int)strlen(t), w = s_ml.width;
+    if (len <= w) return;
+    if (!selected) { strcpy(t + w - 3, "..."); return; }
+    {
+        char loop[ML_CHARS * 2], out[ML_CHARS];
+        int L, i;
+        snprintf(loop, sizeof loop, "%s     ", t);
+        L = (int)strlen(loop);
+        if (now >= s_ml.marquee_at) {
+            s_ml.marquee_pos = (s_ml.marquee_pos + 1) % L;
+            s_ml.marquee_at = now + (s_ml.marquee_pos == 0 ? 1500u : 200u);
+        }
+        for (i = 0; i < w; i++) out[i] = loop[(s_ml.marquee_pos + i) % L];
+        out[w] = 0;
+        strcpy(t, out);
+    }
+}
+
+/* The first space of "Next Song", "Shuffle All" and "Previous Song" stays a
+ * real one: those rows look like the game's own ("NEXTSONG", bold then light). */
+static int ml_word_break(const char *t, uint32_t i)
+{
+    return (i == 4 && !strncmp(t, "Next Song", 9)) || (i == 7 && !strncmp(t, "Shuffle All", 11)) ||
+           (i == 8 && !strncmp(t, "Previous Song", 13)) || (i == 8 && !strncmp(t, "Playlist <", 10));
+}
+
+static void ml_put(uint32_t p, const char *t, char *shown, int nbsp)
+{
+    if (!strcmp(shown, t)) return;
+    uint32_t i;
+    snprintf(shown, ML_CHARS, "%s", t);
+    /* The link list draws each word of a label in turn, bold then light, and
+     * leaves the spaces out ("GAMEOPTIONS"): a song's name keeps its spaces
+     * as no-break spaces, which the font draws as a gap. */
+    for (i = 0; i + 1 < ML_CHARS && t[i]; i++)
+        MEM16(p + i * 2u) = t[i] == ' ' && nbsp && !ml_word_break(t, i) ? s_ml.space : (uint16_t)(unsigned char)t[i];
+    MEM16(p + i * 2u) = 0;
+}
+
+/* Rows, the game's cursor and the "Now Playing" line, from the list's state. */
+static void ml_refresh(void)
+{
+    DWORD now = GetTickCount();
+    int d = ml_depth(), r, maxtop;
+    char t[ML_CHARS * 2];
+    if (d < 0) return;
+    s_ml.count = ml_count();
+    if (s_ml.sel >= s_ml.count) s_ml.sel = s_ml.count - 1;
+    if (s_ml.sel < 0) s_ml.sel = 0;
+    if (s_ml.sel < s_ml.top) s_ml.top = s_ml.sel;
+    if (s_ml.sel >= s_ml.top + ML_ROWS) s_ml.top = s_ml.sel - ML_ROWS + 1;
+    maxtop = s_ml.count > ML_ROWS ? s_ml.count - ML_ROWS : 0;
+    if (s_ml.top > maxtop) s_ml.top = maxtop;
+    if (s_ml.top < 0) s_ml.top = 0;
+    MEM32(ML_FSM + (uint32_t)d * 8u + 4u) = (uint32_t)(s_ml.sel - s_ml.top);
+    if (s_ml.marquee_sel != s_ml.sel) {
+        s_ml.marquee_sel = s_ml.sel;
+        s_ml.marquee_pos = 0;
+        s_ml.marquee_at = now + 1200u;
+    }
+    for (r = 0; r < ML_ROWS; r++) {
+        ml_text(s_ml.top + r, t, sizeof t);
+        ml_fit(t, s_ml.top + r == s_ml.sel, now);
+        ml_put(s_ml.label[r], t, s_ml.shown[r], 1);
+    }
+    /* the line under the title (the runtime's +0x59C, as the VIP screen's "Active VIP") */
+    s_ml.runtime = MEM32(ML_FSM + 0x10Cu);
+    if (s_ml.runtime && s_ml.runtime < 0x04000000u) {
+        char np[ML_CHARS];
+        nfl2k5_music_now_text(np, sizeof np);
+        snprintf(t, sizeof t, "Now Playing: %s", np);
+        if (strlen(t) > 60) strcpy(t + 57, "...");
+        if (strcmp(t, s_ml.sub_shown)) {
+            ml_put(s_ml.sub, t, s_ml.sub_shown, 0);
+            MEM32(0xA83F14u) = 1;
+        }
+        if (MEM32(s_ml.runtime + 0x59Cu) != s_ml.sub) {
+            s_ml.saved_sub = MEM32(s_ml.runtime + 0x59Cu);
+            MEM32(s_ml.runtime + 0x59Cu) = s_ml.sub;
+            MEM32(0xA83F14u) = 1;
+        }
+    }
+}
+
+/* The screen came up: open on the playing song's playlist, the song selected. */
+static void ml_open(void)
+{
+    int ns, ng, n = nfl2k5_music_source_count();
+    s_ml.active = 1;
+    if (nfl2k5_music_now(&ns, &ng)) {
+        s_ml.source = ns;
+        s_ml.sel = ML_FIXED + ng;
+    } else {
+        if (!s_ml.opened_once && n > 2) s_ml.source = 2;    /* the first folder, the first time */
+        if (s_ml.source >= n) s_ml.source = 0;
+        s_ml.sel = ML_PLAYLIST;
+    }
+    s_ml.opened_once = 1;
+    s_ml.count = ml_count();
+    s_ml.top = s_ml.sel - ML_ROWS / 2;
+    s_ml.marquee_sel = -1;
+    memset(s_ml.shown, 0x7F, sizeof s_ml.shown);            /* rewrite every row */
+    s_ml.sub_shown[0] = 0;
+    fprintf(stderr, "[MUSICLIST] open: playlist %d, %d rows, row %d\n", s_ml.source, s_ml.count, s_ml.sel);
+}
+
+static void ml_leave(void)
+{
+    s_ml.active = 0;
+    if (s_ml.runtime && s_ml.runtime < 0x04000000u && MEM32(s_ml.runtime + 0x59Cu) == s_ml.sub) {
+        MEM32(s_ml.runtime + 0x59Cu) = s_ml.saved_sub;
+        MEM32(0xA83F14u) = 1;
+    }
+    fprintf(stderr, "[MUSICLIST] closed\n");
+}
+
+static void ml_move(int step, int wrap)
+{
+    int old = s_ml.sel;
+    s_ml.sel += step;
+    if (s_ml.sel < 0) s_ml.sel = wrap ? s_ml.count - 1 : 0;
+    if (s_ml.sel >= s_ml.count) s_ml.sel = wrap ? 0 : s_ml.count - 1;
+    if (s_ml.sel != old) s_ml.sound = 1;
+}
+
+static void ml_page(int dir)
+{
+    int old = s_ml.sel, maxtop = s_ml.count > ML_ROWS ? s_ml.count - ML_ROWS : 0;
+    s_ml.sel += dir * ML_ROWS;
+    s_ml.top += dir * ML_ROWS;                               /* the cursor keeps its place on screen */
+    if (s_ml.top > maxtop) s_ml.top = maxtop;
+    if (s_ml.top < 0) s_ml.top = 0;
+    if (s_ml.sel < 0) s_ml.sel = 0;
+    if (s_ml.sel >= s_ml.count) s_ml.sel = s_ml.count - 1;
+    if (s_ml.sel != old) s_ml.sound = 1;
+}
+
+static void ml_playlist(int dir)
+{
+    int n = nfl2k5_music_source_count(), ns, ng;
+    if (n < 1) return;
+    s_ml.source = (s_ml.source + n + dir) % n;
+    s_ml.count = ml_count();
+    if (s_ml.sel >= ML_FIXED) {                              /* on a song: the new list's playing or first song */
+        s_ml.sel = nfl2k5_music_now(&ns, &ng) && ns == s_ml.source ? ML_FIXED + ng : ML_FIXED;
+        if (s_ml.sel >= s_ml.count) s_ml.sel = ML_PLAYLIST;
+        s_ml.top = s_ml.sel - ML_ROWS / 2;
+    }
+    s_ml.sound = 1;
+    fprintf(stderr, "[MUSICLIST] playlist %d: %d songs\n", s_ml.source, s_ml.count - ML_FIXED);
+}
+
+/* The pad, before the game reads it (any port; src/nfl2k5_input_hle.c). */
+void nfl2k5_music_list_input(int port, XBOX_GAMEPAD *g)
+{
+    WORD b, pb;
+    DWORD now;
+    int vdir, sx, hstep = 0, step = 0, wrap = 0, page = 0;
+    if (!s_ml.header || port < 0 || port > 3) return;
+    if (!ml_on_top()) {
+        if (s_ml.active) ml_leave();
+        s_ml.prev_buttons[port] = g->wButtons;
+        memcpy(s_ml.prev_analog[port], g->bAnalogButtons, 8);
+        s_ml.prev_sx[port] = 0;
+        s_ml.repeat_dir[port] = 0;
+        return;
+    }
+    if (!s_ml.active) ml_open();
+    now = GetTickCount();
+    b = g->wButtons;
+    pb = s_ml.prev_buttons[port];
+    vdir = (b & 0x01) || g->sThumbLY > 16000 ? -1 : (b & 0x02) || g->sThumbLY < -16000 ? 1 : 0;
+    sx = g->sThumbLX < -16000 ? -1 : g->sThumbLX > 16000 ? 1 : 0;
+    if (vdir) {
+        if (vdir != s_ml.repeat_dir[port]) {                 /* a new press: one row, wrapping at the ends */
+            step = vdir;
+            wrap = 1;
+            s_ml.repeat_dir[port] = vdir;
+            s_ml.held_since[port] = now;
+            s_ml.repeat_at[port] = now + 380u;
+        } else if ((int)(now - s_ml.repeat_at[port]) >= 0) { /* held: faster and faster, stopping at the ends */
+            DWORD held = now - s_ml.held_since[port];
+            step = vdir;
+            s_ml.repeat_at[port] = now + (held > 2500u ? 25u : held > 1200u ? 50u : 100u);
+        }
+    } else {
+        s_ml.repeat_dir[port] = 0;
+    }
+    if (((b & 0x04) && !(pb & 0x04)) || (sx < 0 && s_ml.prev_sx[port] >= 0) ||
+        (g->bAnalogButtons[6] > 128 && s_ml.prev_analog[port][6] <= 128)) hstep = -1;
+    if (((b & 0x08) && !(pb & 0x08)) || (sx > 0 && s_ml.prev_sx[port] <= 0) ||
+        (g->bAnalogButtons[7] > 128 && s_ml.prev_analog[port][7] <= 128)) hstep = 1;
+    if (g->bAnalogButtons[5] > 128 && s_ml.prev_analog[port][5] <= 128) page = -1;   /* LB (White) */
+    if (g->bAnalogButtons[4] > 128 && s_ml.prev_analog[port][4] <= 128) page = 1;    /* RB (Black) */
+    s_ml.prev_buttons[port] = b;
+    memcpy(s_ml.prev_analog[port], g->bAnalogButtons, 8);
+    s_ml.prev_sx[port] = sx;
+    s_ml.count = ml_count();
+    if (hstep) ml_playlist(hstep);
+    else if (page) ml_page(page);
+    else if (step) ml_move(step, wrap);
+    /* the list's buttons stop here; A, START, B and the rest go on to the game */
+    g->wButtons &= (WORD)~0x0Fu;
+    g->bAnalogButtons[4] = g->bAnalogButtons[5] = g->bAnalogButtons[6] = g->bAnalogButtons[7] = 0;
+    g->sThumbLX = g->sThumbLY = 0;
+    if (port == 0 || hstep || page || step) ml_refresh();
+}
+
+/* Every front-end frame, on the guest thread (nfl2k5_music_frame_service):
+ * the cursor sound of a move. */
+void nfl2k5_music_list_service(void)
+{
+    uint32_t keep_eax, keep_ecx, keep_edx, keep_ebx, keep_esi, keep_edi, keep_ebp;
+    if (!s_ml.sound) return;
+    s_ml.sound = 0;
+    if (!s_ml.sounds || !ml_on_top()) return;
+    keep_eax = g_eax; keep_ecx = g_ecx; keep_edx = g_edx; keep_ebx = g_ebx;
+    keep_esi = g_esi; keep_edi = g_edi; keep_ebp = g_ebp;
+    g_ecx = ML_SND_CURSOR; g_edx = 0;
+    PUSH32(g_esp, ML_FN_BASE);
+    sub_0014D390();
+    g_eax = keep_eax; g_ecx = keep_ecx; g_edx = keep_edx; g_ebx = keep_ebx;
+    g_esi = keep_esi; g_edi = keep_edi; g_ebp = keep_ebp;
+}
+
+/* A (or START) on a row: the game calls the row's action (ecx = FSM, edx = the item). */
+static void ml_fn(void)
+{
+    int row = (int)((s_ml_called - ML_FN_BASE) / 0x40u), v = s_ml.top + row;
+    uint32_t keep_ebx = g_ebx, keep_esi = g_esi, keep_edi = g_edi, keep_ebp = g_ebp;
+    s_ml.count = ml_count();
+    fprintf(stderr, "[MUSICLIST] A on row %d (list row %d of %d, playlist %d)\n", row, v, s_ml.count, s_ml.source);
+    if (v >= 0 && v < s_ml.count) {
+        if (v == ML_PLAYLIST) ml_playlist(1);
+        else if (v == ML_SHUFFLE) nfl2k5_music_play(s_ml.source, -1, s_ml.source >= 2);
+        else if (v == ML_NEXT) nfl2k5_music_skip(1);
+        else if (v == ML_PREV) nfl2k5_music_skip(-1);
+        else nfl2k5_music_play(s_ml.source, v - ML_FIXED, 0);
+        if (s_ml.sounds && v != ML_PLAYLIST) {
+            g_ecx = ML_SND_SELECT; g_edx = 0;
+            PUSH32(g_esp, ML_FN_BASE);
+            sub_0014D390();
+        }
+        if (s_ml.active) ml_refresh();
+    }
+    g_ebx = keep_ebx; g_esi = keep_esi; g_edi = keep_edi; g_ebp = keep_ebp;
+    g_esp += 4;                                              /* plain ret */
+}
+
+static recomp_func_t ml_lookup(uint32_t address)
+{
+    if (!s_ml.header || (address - ML_FN_BASE) / 0x40u >= ML_ROWS || (address & 0x3Fu)) return NULL;
+    s_ml_called = address;
+    return ml_fn;
+}
+
+static int ml_wstr_is(uint32_t text, const char *s)
+{
+    while (*s && MEM16(text) == (uint16_t)(unsigned char)*s) { s++; text += 2u; }
+    return !*s && MEM16(text) == 0;
+}
+
+/* The screen: a copy of the Features menu's header with seven action rows. */
+static uint32_t ml_install(void)
+{
+    uint32_t tmpl = vm_link_target(MAIN_MENU_HEADER, "Features"), header, rows, k;
+    int i;
+    const char *w = getenv("NFL2K5_MUSIC_LIST_WIDTH");
+    if (!tmpl) { fprintf(stderr, "[MUSICLIST] off: no Features menu to copy (a mod pack's layout?)\n"); return 0; }
+    s_ml.width = w && atoi(w) >= 12 && atoi(w) < ML_CHARS ? atoi(w) : 30;
+    {
+        const char *sp = getenv("NFL2K5_MUSIC_LIST_SPACE");   /* test: another character for a space */
+        s_ml.space = sp && strtoul(sp, NULL, 0) ? (uint16_t)strtoul(sp, NULL, 0) : 0x00A0u;
+    }
+    header = vm_alloc(VM_ROW);
+    rows = vm_alloc(VM_ROW * (ML_ROWS + 1u));
+    s_ml.sub = vm_alloc(ML_CHARS * 2u);
+    if (!header || !rows || !s_ml.sub) return 0;
+    vm_copy(header, tmpl, VM_ROW);
+    MEM32(header + 0x00) = vm_wstr("Music Player");
+    MEM32(header + 0x04) = 0;                                /* no event table: the template's runs Features code */
+    MEM32(header + 0x0C) = 0;                                /* no help bar */
+    MEM32(header + 0x10) = rows;
+    for (i = 0; i <= ML_ROWS; i++)
+        for (k = 0; k < VM_ROW; k += 4) MEM32(rows + VM_ROW * (uint32_t)i + k) = 0;
+    for (i = 0; i < ML_ROWS; i++) {
+        uint32_t r = rows + VM_ROW * (uint32_t)i;
+        s_ml.label[i] = vm_alloc(ML_CHARS * 2u);
+        if (!s_ml.label[i]) return 0;
+        vm_put_wstr(s_ml.label[i], "", ML_CHARS);
+        MEM32(r + 0x00) = 9;                                 /* action row */
+        MEM32(r + 0x04) = s_ml.label[i];
+        MEM32(r + 0x28) = ML_FN_BASE + (uint32_t)i * 0x40u;
+    }
+    MEM32(rows + VM_ROW * ML_ROWS) = 3;                      /* end row */
+    vm_put_wstr(s_ml.sub, "", ML_CHARS);
+    if (!MEM32(header)) return 0;
+    s_ml.sounds = ml_wstr_is(ML_SND_SELECT, "Ambient: Menu Select") && ml_wstr_is(ML_SND_CURSOR, "Ambient: Menu Move Cursor");
+    s_ml.header = header;
+    return header;
+}
+
 /* Debug: NFL2K5_MEMDUMP=addr:len[,addr:len...] writes guest memory to
  * logs\memdump_<addr>.bin after NFL2K5_MEMDUMP_DELAY seconds (default 60),
  * then every 10 s -- used to read the menu layout the game builds at run
@@ -685,30 +1070,24 @@ void nfl2k5_video_menu_install(void)
             vm_add_link(k_options_headers[k], phone, vm_wstr("Phone Settings"));
     }
 #endif
-#ifdef NFL2K5_MENU_MUSIC_ROWS
-    {   /* the F1 page's Music Player: a phone has no F1 menu */
-        uint32_t music;
-        s_screens[VM_MUSIC].rows = nfl2k5_music_rows();
-        for (i = 0; i < s_screens[VM_MUSIC].rows && i < VM_MAX_ROWS; i++)
-            s_music_labels[i] = nfl2k5_music_row_label(i);
-        music = vm_build_screen(VM_MUSIC);
+    if (!getenv("NFL2K5_NO_MUSIC_LIST")) {   /* Options > Music Player: the song list, every platform */
+        uint32_t music = ml_install();
         for (k = 0; music && k < sizeof k_options_headers / sizeof k_options_headers[0]; k++)
             vm_add_link(k_options_headers[k], music, vm_wstr("Music Player"));
-        fprintf(stderr, "[VIDEOMENU] Music Player %08X: %d rows\n", (unsigned)music, s_screens[VM_MUSIC].rows);
+        fprintf(stderr, "[VIDEOMENU] Music Player %08X: a song list of %d rows\n", (unsigned)music, ML_ROWS);
+    }
 #ifdef NFL2K5_MENU_GPU_ROWS
-        {   /* A link in Options, like the screens around it. Never a link inside a
-             * screen of value rows: the game calls every row's value functions there,
-             * a link row has none, and Phone Settings crashed on opening (test31). */
-            uint32_t gpu;
-            s_screens[VM_GPU].rows = nfl2k5_gpu_rows();
-            for (i = 0; i < s_screens[VM_GPU].rows && i < VM_MAX_ROWS; i++)
-                s_gpu_labels[i] = nfl2k5_gpu_row_label(i);
-            gpu = vm_build_screen(VM_GPU);
-            for (k = 0; gpu && k < sizeof k_options_headers / sizeof k_options_headers[0]; k++)
-                vm_add_link(k_options_headers[k], gpu, vm_wstr("GPU Driver"));
-            fprintf(stderr, "[VIDEOMENU] GPU Driver %08X: %d rows\n", (unsigned)gpu, s_screens[VM_GPU].rows);
-        }
-#endif
+    {   /* A link in Options, like the screens around it. Never a link inside a
+         * screen of value rows: the game calls every row's value functions there,
+         * a link row has none, and Phone Settings crashed on opening (test31). */
+        uint32_t gpu;
+        s_screens[VM_GPU].rows = nfl2k5_gpu_rows();
+        for (i = 0; i < s_screens[VM_GPU].rows && i < VM_MAX_ROWS; i++)
+            s_gpu_labels[i] = nfl2k5_gpu_row_label(i);
+        gpu = vm_build_screen(VM_GPU);
+        for (k = 0; gpu && k < sizeof k_options_headers / sizeof k_options_headers[0]; k++)
+            vm_add_link(k_options_headers[k], gpu, vm_wstr("GPU Driver"));
+        fprintf(stderr, "[VIDEOMENU] GPU Driver %08X: %d rows\n", (unsigned)gpu, s_screens[VM_GPU].rows);
     }
 #endif
     /* "Presentation" right under VIP on the pre-game screen. */

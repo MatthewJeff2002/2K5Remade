@@ -293,6 +293,13 @@ static void host_keyboard_gamepad(XBOX_GAMEPAD *g)
     if (KEY(SDL_SCANCODE_D)) g->sThumbLX = 32767;
     if (KEY(SDL_SCANCODE_W)) g->sThumbLY = 32767;
     if (KEY(SDL_SCANCODE_S)) g->sThumbLY = -32767;
+    {   /* Page Up / Page Down: a page of the Music Player's song list */
+        extern int nfl2k5_music_list_active(void);
+        if (nfl2k5_music_list_active()) {
+            if (KEY(SDL_SCANCODE_PAGEUP)) g->bAnalogButtons[5] = 255;
+            if (KEY(SDL_SCANCODE_PAGEDOWN)) g->bAnalogButtons[4] = 255;
+        }
+    }
 #undef KEY
 }
 
@@ -334,6 +341,10 @@ static void host_gamepad_port(int port, XBOX_GAMEPAD *g)
     {
         extern void nfl2k5_cs_input(int port, XBOX_GAMEPAD *g);
         nfl2k5_cs_input(port, g);
+    }
+    {   /* Options > Music Player: the song list takes its buttons (src/nfl2k5_video_menu.c) */
+        extern void nfl2k5_music_list_input(int port, XBOX_GAMEPAD *g);
+        nfl2k5_music_list_input(port, g);
     }
     if (port != 0)
         return;
