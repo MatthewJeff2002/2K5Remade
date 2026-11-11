@@ -839,6 +839,88 @@ static void repair_save_folders(const std::string &base, const std::string &udat
     if (moved) fprintf(stderr, "[SAVE-LIBRARY] %d save(s) moved to their name's folder, %d renamed (duplicate names)\n", moved, renamed);
 }
 
+/* ---- deletions (0.8.1) ------------------------------------------------------
+ * The library and UDATA are synced both ways, so in 0.8.0 a save deleted on one
+ * side came straight back from the other: a roster removed in the game's own
+ * menu, or from saves\rosters or saves\UDATA by hand, returned at the next
+ * start (players: "an error about rosters even after deleting the roster
+ * files"). saves\library-state.txt lists the saves present on both sides at
+ * the last sync; one of those gone from a side was deleted there, and its
+ * other copy is moved to saves\backups\deleted\<kind>\ instead of being
+ * copied back. Matching is by container id (the manifest), so a renamed or
+ * re-filed save is never taken for a deleted one. */
+static std::string state_path() { return join(g_save_root, "library-state.txt"); }
+
+static std::map<std::string, std::string> library_containers(const std::string &base)
+{
+    std::map<std::string, std::string> out;      /* container -> library folder */
+    for (const auto &kind : kKinds) {
+        std::string parent = join(base, kind.folder);
+        for (const std::string &folder : dirs(parent)) {
+            std::string dir = join(parent, folder);
+            if (!is_file(join(dir, "SAVEGAME.DAT"))) continue;
+            auto m = read_manifest(dir);
+            if (valid_container_id(m["container"])) out[m["container"]] = dir;
+        }
+    }
+    return out;
+}
+
+static bool udata_has(const std::string &udata, const std::string &id)
+{
+    return is_file(join(join(udata, id), "SAVEGAME.DAT"));
+}
+
+static void set_aside(const std::string &dir, const std::string &label)
+{
+    SYSTEMTIME t;
+    char stamp[40];
+    GetLocalTime(&t);
+    snprintf(stamp, sizeof stamp, " %04u-%02u-%02u %02u.%02u.%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    std::string parent = join(join(g_save_root, "backups"), "deleted");
+    make_dirs(parent);
+    std::string dst = join(parent, safe_name(label, "Save") + stamp);
+    if (MoveFileExA(dir.c_str(), dst.c_str(), MOVEFILE_WRITE_THROUGH))
+        fprintf(stderr, "[SAVE-LIBRARY] %s was deleted on the other side; this copy is kept in %s\n", label.c_str(), dst.c_str());
+    else
+        fprintf(stderr, "[SAVE-LIBRARY] could not set aside %s (%lu)\n", dir.c_str(), GetLastError());
+}
+
+static void apply_deletions(const std::string &base, const std::string &udata)
+{
+    std::ifstream f(state_path());
+    if (!f) return;                               /* first run with 0.8.1: nothing known yet */
+    auto lib = library_containers(base);
+    for (std::string id; std::getline(f, id);) {
+        id = trim(id);
+        if (!valid_container_id(id)) continue;
+        bool in_u = udata_has(udata, id);
+        auto it = lib.find(id);
+        bool in_l = it != lib.end();
+        if (in_u && !in_l) {
+            std::string name = trim(read_utf16_value(join(join(udata, id), "SaveMeta.xbx"), "Name="));
+            set_aside(join(udata, id), "UDATA " + (name.empty() ? id : name));
+        } else if (!in_u && in_l) {
+            std::string folder = it->second.substr(it->second.find_last_of("\\/") + 1);
+            set_aside(it->second, folder);
+        }
+    }
+}
+
+static void save_state(const std::string &base, const std::string &udata)
+{
+    auto lib = library_containers(base);
+    std::string tmp = state_path() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) return;
+        f << "# saves on both sides at the last sync (0.8.1 save library; delete this file to forget)\n";
+        for (const auto &e : lib)
+            if (udata_has(udata, e.first)) f << e.first << "\n";
+    }
+    MoveFileExA(tmp.c_str(), state_path().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
 static void sync_once()
 {
     std::string title = join(join(g_save_root, "UDATA"), "53450030");
@@ -850,10 +932,12 @@ static void sync_once()
     for (const auto &k : kKinds) make_dirs(join(g_save_root, k.folder));
     make_dirs(join(g_save_root, "import"));
     process_import_inbox(g_save_root);
+    apply_deletions(g_save_root, title);
     backup_changed(g_save_root, title);
     import_library(g_save_root, title);
     migrate_udata_signatures(title);
     mirror_udata(g_save_root, title);
+    save_state(g_save_root, title);
 }
 
 /* Names, sizes and modification times of everything the sync looks at --
