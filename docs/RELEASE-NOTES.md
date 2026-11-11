@@ -51,6 +51,12 @@ your settings, saves, Music, mods and your own presentation packages are kept
 
 ## Changed
 
+- **Music Player: scroll through your songs and pick one** instead of skipping
+  them one by one. Options > Music Player (in the game's own menus) lists the
+  playlist's songs: Up/Down scroll (hold to go faster), LB/RB or Page Up/Page
+  Down jump a page, Left/Right or LT/RT change the playlist, A plays the song.
+  Shuffle All, Next Song and Previous Song are there too; the playing song is
+  marked. F1 > Music Player lists every song as well (LT/RT jump a page).
 - Frame Rate Cap offers 30, 60 or Original. The game simulates at most 60
   frames a second, so "120" and "Unlimited" were always a 60 lock and are
   gone; more than 60 on screen is Frame Generation (Direct3D 12, off by
