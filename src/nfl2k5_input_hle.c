@@ -104,6 +104,14 @@ static int host_pads_ignored(void)
 }
 
 static int s_script_f5;   /* a scripted "f5" press is being held */
+/* Scripted sticks: tokens ls/rs + l/r/u/d ("lsu" = left stick up, "rsr" =
+ * right stick right) push that stick all the way for one press. */
+static short s_script_stick[4];   /* lx, ly, rx, ry */
+static void script_sticks(XBOX_GAMEPAD *g)
+{
+    if (s_script_stick[0] || s_script_stick[1]) { g->sThumbLX = s_script_stick[0]; g->sThumbLY = s_script_stick[1]; }
+    if (s_script_stick[2] || s_script_stick[3]) { g->sThumbRX = s_script_stick[2]; g->sThumbRY = s_script_stick[3]; }
+}
 
 static WORD file_press(BYTE analog[8])
 {
@@ -172,9 +180,18 @@ static WORD file_press(BYTE analog[8])
         else if (!strcmp(name, "rt")) analog[7] = 255;
         else if (!strcmp(name, "l3")) buttons |= 0x40;
         else if (!strcmp(name, "r3")) buttons |= 0x80;
+        else if (strlen(name) == 3 && (name[0] == 'l' || name[0] == 'r') && name[1] == 's') {
+            int k = name[0] == 'r' ? 2 : 0;
+            memset(s_script_stick, 0, sizeof s_script_stick);
+            if (name[2] == 'l') s_script_stick[k] = -32767;
+            else if (name[2] == 'r') s_script_stick[k] = 32767;
+            else if (name[2] == 'u') s_script_stick[k + 1] = 32767;
+            else if (name[2] == 'd') s_script_stick[k + 1] = -32767;
+        }
         if (now - step_start >= (Uint64)hold) {
             pressing = 0;
             s_script_f5 = 0;
+            memset(s_script_stick, 0, sizeof s_script_stick);
             step_start = now;
             head = (head + 1) % 64;
         }
@@ -337,6 +354,7 @@ static void host_gamepad_port(int port, XBOX_GAMEPAD *g)
         host_touch_gamepad(g);
         g->wButtons |= auto_press(g->bAnalogButtons);
         g->wButtons |= file_press(g->bAnalogButtons);
+        script_sticks(g);
     }
     {
         extern void nfl2k5_cs_input(int port, XBOX_GAMEPAD *g);
@@ -380,6 +398,7 @@ static void host_gamepad(XBOX_GAMEPAD *g)
     host_touch_gamepad(g);
     g->wButtons |= auto_press(g->bAnalogButtons);
     g->wButtons |= file_press(g->bAnalogButtons);
+    script_sticks(g);
     audio_report_combo(g);
     {   /* L3: show what is playing; R3: next song (local music library). */
         extern void nfl2k5_local_music_buttons(int l3, int r3);
