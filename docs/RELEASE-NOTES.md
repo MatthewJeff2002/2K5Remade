@@ -57,6 +57,12 @@ your settings, saves, Music, mods and your own presentation packages are kept
   Down jump a page, Left/Right or LT/RT change the playlist, A plays the song.
   Shuffle All, Next Song and Previous Song are there too; the playing song is
   marked. F1 > Music Player lists every song as well (LT/RT jump a page).
+- **My Camera stays on your side.** It now follows the end your team attacks, so it
+  no longer flips after an interception, punt or kickoff, and a spot saved on
+  defense comes back the same on offense. New Camera-screen row "My Camera
+  Follows": Your Team (default), Offense (the old behaviour) or Fixed Side.
+  Saving works with Back + D-pad Up in either order, or F5. Free Cam's right
+  stick was backwards (right turned left, up looked down) and is fixed.
 - Frame Rate Cap offers 30, 60 or Original. The game simulates at most 60
   frames a second, so "120" and "Unlimited" were always a 60 lock and are
   gone; more than 60 on screen is Frame Generation (Direct3D 12, off by
