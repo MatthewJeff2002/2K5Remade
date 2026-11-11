@@ -39,7 +39,9 @@ static struct {
     int heat;           /* lower the quality while the phone is hot */
     int gpu_safety;     /* 0 automatic (on after a GPU crash), 1 off, 2 on */
     int gpu_level;      /* what automatic reached: 0 normal, 1 safe, 2 safe + fresh pipeline cache */
-} s_set = { 0, 1, 2, 0, 1, 1, 0, 0 };
+    int touch_btn;      /* Show/Hide Button: 0 auto (fades while hidden), 1 always, 2 never */
+    int touch_hidden;   /* the player hid the controls (HIDE, three-finger tap) */
+} s_set = { 0, 1, 2, 0, 1, 1, 0, 0, 0, 0 };
 static int s_safety_notice;            /* graphics safety: toast once the menus are up */
 
 static void ini_path(char *out, size_t n)
@@ -61,9 +63,11 @@ static void save(void)
                "battery_saver = %d\npause_in_background = %d\nheat_control = %d\n"
                "; graphics_safety: 0 automatic (on after a crash in the GPU driver), 1 off, 2 on\n"
                "graphics_safety = %d\n; graphics_safety_level: what automatic has reached (0 normal, 1-2 safe)\n"
-               "graphics_safety_level = %d\n",
+               "graphics_safety_level = %d\n"
+               "; show_hide_button: 0 auto (fades while the controls are hidden), 1 always, 2 never (three-finger tap)\n"
+               "show_hide_button = %d\ntouch_hidden = %d\n",
             s_set.touch, s_set.touch_size, s_set.touch_opacity, s_set.battery_saver, s_set.pause_bg, s_set.heat,
-            s_set.gpu_safety, s_set.gpu_level);
+            s_set.gpu_safety, s_set.gpu_level, s_set.touch_btn, s_set.touch_hidden);
     fclose(f);
 }
 
@@ -84,12 +88,17 @@ static void load(void)
         else if (!strcmp(key, "heat_control")) s_set.heat = v != 0;
         else if (!strcmp(key, "graphics_safety")) s_set.gpu_safety = v >= 0 && v <= 2 ? v : 0;
         else if (!strcmp(key, "graphics_safety_level")) s_set.gpu_level = v >= 0 && v <= 2 ? v : 0;
+        else if (!strcmp(key, "show_hide_button")) s_set.touch_btn = v >= 0 && v <= 2 ? v : 0;
+        else if (!strcmp(key, "touch_hidden")) s_set.touch_hidden = v != 0;
     }
     fclose(f);
 }
 
 /* ---- touch controls (touch_pad.c) ---- */
 int nfl2k5_touch_mode(void) { return s_set.touch; }
+int nfl2k5_touch_button_mode(void) { return s_set.touch_btn; }
+int nfl2k5_touch_hidden(void) { return s_set.touch_hidden; }
+void nfl2k5_touch_set_hidden(int h) { s_set.touch_hidden = h != 0; save(); nfl2k5_touch_pad_changed(); }
 void nfl2k5_touch_set_mode(int m) { s_set.touch = m; save(); nfl2k5_touch_pad_changed(); }
 float nfl2k5_touch_scale(void) { static const float k[] = { 0.85f, 1.0f, 1.18f }; return k[s_set.touch_size % 3]; }
 float nfl2k5_touch_alpha(void) { static const float k[] = { 0.45f, 0.75f, 1.0f, 1.35f }; return k[s_set.touch_opacity % 4]; }
@@ -396,9 +405,9 @@ static void JNICALL jni_trim_memory(JNIEnv *env, jclass cls, jint level)
 }
 
 /* ---- Options > Phone Settings rows (src/nfl2k5_video_menu.c) ---- */
-enum { PS_TOUCH, PS_SIZE, PS_OPACITY, PS_EDIT, PS_BATTERY, PS_HEAT, PS_PAUSE, PS_SONGS, PS_SAFETY, PS_FOLDER, PS_COUNT };
+enum { PS_TOUCH, PS_SIZE, PS_OPACITY, PS_BUTTON, PS_EDIT, PS_BATTERY, PS_HEAT, PS_PAUSE, PS_SONGS, PS_SAFETY, PS_FOLDER, PS_COUNT };
 static const char *const k_labels[PS_COUNT] = { "Touch Controls", "Touch Button Size", "Touch Opacity",
-                                                "Edit Touch Layout", "Battery Saver", "Heat Control",
+                                                "Show/Hide Button", "Edit Touch Layout", "Battery Saver", "Heat Control",
                                                 "Pause When Leaving", "Add Songs", "Graphics Safety", "Game Folder" };
 extern int nfl2k5_folder_count(void);                         /* game_folder.c */
 extern int nfl2k5_folder_selected(void);
@@ -410,7 +419,7 @@ int nfl2k5_phone_toggle(int r) { return r == PS_PAUSE; }
 int nfl2k5_phone_values(int r)
 {
     switch (r) {
-    case PS_TOUCH: case PS_SIZE: return 3;
+    case PS_TOUCH: case PS_SIZE: case PS_BUTTON: return 3;
     case PS_OPACITY: return 4;
     case PS_SONGS: case PS_EDIT: return 2;
     case PS_SAFETY: return 3;
@@ -424,6 +433,7 @@ int nfl2k5_phone_get(int r)
     case PS_TOUCH: return s_set.touch;
     case PS_SIZE: return s_set.touch_size;
     case PS_OPACITY: return s_set.touch_opacity;
+    case PS_BUTTON: return s_set.touch_btn;
     case PS_BATTERY: return s_set.battery_saver;
     case PS_PAUSE: return s_set.pause_bg;
     case PS_HEAT: return s_set.heat;
@@ -435,7 +445,8 @@ int nfl2k5_phone_get(int r)
 void nfl2k5_phone_set(int r, int v)
 {
     switch (r) {
-    case PS_TOUCH: s_set.touch = v; nfl2k5_touch_pad_changed(); break;
+    case PS_TOUCH: s_set.touch = v; s_set.touch_hidden = 0; nfl2k5_touch_pad_changed(); break;   /* a choice here shows them again */
+    case PS_BUTTON: s_set.touch_btn = v; nfl2k5_touch_pad_changed(); break;
     case PS_SIZE: s_set.touch_size = v; nfl2k5_touch_pad_changed(); break;
     case PS_OPACITY: s_set.touch_opacity = v; nfl2k5_touch_pad_changed(); break;
     case PS_BATTERY: s_set.battery_saver = v != 0; g_xbox_battery_saver = s_set.battery_saver;
@@ -466,6 +477,7 @@ void nfl2k5_phone_value_name(int r, int v, char *b, size_t n)
     case PS_TOUCH: snprintf(b, n, "%s", touch[(unsigned)v % 3u]); break;
     case PS_SIZE: snprintf(b, n, "%s", size[(unsigned)v % 3u]); break;
     case PS_OPACITY: snprintf(b, n, "%s", opacity[(unsigned)v % 4u]); break;
+    case PS_BUTTON: snprintf(b, n, "%s", v == 1 ? "Always" : v == 2 ? "Never (3-finger tap)" : "Auto"); break;
     case PS_SONGS: snprintf(b, n, "%s", "Choose from phone"); break;
     case PS_EDIT: snprintf(b, n, "%s", "Move and resize"); break;
     /* the two settings allowed to change the picture say so */
