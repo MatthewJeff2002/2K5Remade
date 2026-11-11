@@ -33,6 +33,13 @@ void nfl2k5_broadcast_cam_set_mode(int mode);
 int  nfl2k5_broadcast_cam_mode_count(void);
 const char *nfl2k5_broadcast_cam_mode_name(int mode);
 
+/* My Camera "follows": 0 Your Team (default), 1 Offense, 2 Fixed Side; kept in
+ * nfl2k5_camera.ini. Which way the saved spot's along-the-field part points. */
+int  nfl2k5_broadcast_cam_follow(void);
+void nfl2k5_broadcast_cam_set_follow(int follow);
+int  nfl2k5_broadcast_cam_follow_count(void);
+const char *nfl2k5_broadcast_cam_follow_name(int follow);
+
 /* Legacy on/off shim (On == Broadcast). */
 int  nfl2k5_broadcast_cam_enabled(void);
 void nfl2k5_broadcast_cam_set_enabled(int on);

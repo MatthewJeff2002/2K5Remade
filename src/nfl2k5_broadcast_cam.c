@@ -25,11 +25,17 @@
 #include "nfl2k5_broadcast_cam.h"
 #include "nfl2k5_sandbox_world.h"
 #include "nfl2k5_sandbox_actors.h"
+#include "nfl2k5_coach_mode.h"
 
 #define IN_GAME  0x00A83A18u   /* == 3 while a match is live */
 #define FLOW     0x00E602B8u   /* on-field play when 11..18; 5 = play-call menu */
 #define DRIVE    0x00E602ECu   /* live drive struct: ball spot at +0x18 */
 #define CLOCK    0x00E6028Cu   /* game clock object (the actors list keys off it) */
+#define OFF_SIDE 0x00E60280u   /* -> the offense's side object (SIDE_HOME or SIDE_AWAY) */
+#define SIDE_HOME 0x00E5FC20u
+#define SIDE_AWAY 0x00E5FC60u
+#define PORT_SIDE 0x00E5FE88u  /* + port * 0x1C: 1 home, 2 away, 0 CPU (controller assign) */
+#define PORT_STRIDE 0x1Cu
 #define PI_F     3.14159265358979323846f
 
 static const char *const k_mode_names[NFL2K5_BCAST_MODE_COUNT] = {
@@ -86,10 +92,19 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ?
  * The player places the camera with Free Cam and saves it with Back + D-pad
  * Up on any controller (together, or one right after the other) or F5 on the
  * keyboard (see mycam_combo). What is kept is where the camera sits relative to the ball -- its
- * offset, with the along-the-field part in the offense's direction so the
- * shot flips with possession -- and its zoom. In play the camera holds that
- * offset from the ball and always aims at it, so a deep ball or a long run
- * stays in the picture. Saved in nfl2k5_camera.ini in the user folder. */
+ * offset, turned into the frame of "follow" (below) -- and its zoom. In play
+ * the camera holds that offset from the ball and always aims at it, so a deep
+ * ball or a long run stays in the picture. Saved in nfl2k5_camera.ini in the
+ * user folder.
+ *
+ * follow (2026-11-11; Camera screen "My Camera Follows", ini "follow ="):
+ *   team    (default) the way the user's team attacks -- the team a controller
+ *           is assigned to, or Coach Mode's team. It turns only when the ends
+ *           change (quarters), never on a change of possession, so a spot
+ *           saved on defense is the same spot on offense. CPU vs CPU, or
+ *           players on both teams: the home team's way.
+ *   offense the way the offense is going (the old behaviour: flips with possession).
+ *   fixed   one end of the field all game. */
 #define BTN_UP   0x0001u
 #define BTN_BACK 0x0020u
 #define BTN_KEY_SAVE NFL2K5_BCAST_KEY_SAVE   /* keyboard F5, folded in by the input layer */
@@ -97,6 +112,12 @@ typedef struct { int have; float dx, dy, dz, fov, ahead, lift; } MyCam;   /* ahe
 static MyCam s_my;
 static int s_my_loaded;
 static float s_dir = 1.f;              /* +1 / -1: the way the offense is going (along z) */
+enum { FOLLOW_TEAM, FOLLOW_OFFENSE, FOLLOW_FIXED, FOLLOW_COUNT };
+static const char *const k_follow_key[FOLLOW_COUNT] = { "team", "offense", "fixed" };
+static const char *const k_follow_name[FOLLOW_COUNT] = { "Your Team", "Offense", "Fixed Side" };
+static int s_follow = FOLLOW_TEAM;
+static float s_home_dir;               /* +1 / -1: the way the home team attacks; 0 = not seen yet */
+static uint32_t s_home_dir_clock;      /* the match s_home_dir belongs to */
 void xbox_PresentToast(const char *header, const char *line1, const char *line2, unsigned ms);
 char *xbox_user_path(const char *rel, char *out, size_t n);
 
@@ -108,19 +129,25 @@ static void mycam_load(void)
     s_my_loaded = 1;
     if ((f = fopen(xbox_user_path("nfl2k5_camera.ini", path, sizeof path), "r")) != NULL) {
         MyCam m;
+        char line[256], key[16];
         memset(&m, 0, sizeof m);
-        if (fscanf(f, " offset = %f %f %f fov = %f", &m.dx, &m.dy, &m.dz, &m.fov) == 4 &&
-                isfinite(m.dx) && isfinite(m.dy) && isfinite(m.dz) && m.fov > 5.f && m.fov < 120.f) {
+        while (fgets(line, sizeof line, f)) {
             float ahead, lift;
+            int i;
+            if (sscanf(line, " offset = %f %f %f fov = %f", &m.dx, &m.dy, &m.dz, &m.fov) == 4) {
+                if (isfinite(m.dx) && isfinite(m.dy) && isfinite(m.dz) && m.fov > 5.f && m.fov < 120.f)
+                    m.have = 1;
             /* optional: aim = <ahead> <up> -- look that far downfield of the
              * ball (and above it), so the ball sits low in the picture with
              * the field ahead in view, as in a behind-the-offense game camera */
-            if (fscanf(f, " aim = %f %f", &ahead, &lift) == 2 && isfinite(ahead) && isfinite(lift)) {
+            } else if (sscanf(line, " aim = %f %f", &ahead, &lift) == 2 && isfinite(ahead) && isfinite(lift)) {
                 m.ahead = clampf(ahead, -3000.f, 3000.f); m.lift = clampf(lift, -500.f, 1500.f);
+            } else if (sscanf(line, " follow = %15s", key) == 1) {
+                for (i = 0; i < FOLLOW_COUNT; i++)
+                    if (!_stricmp(key, k_follow_key[i])) s_follow = i;
             }
-            m.have = 1;
-            s_my = m;
         }
+        if (m.have) s_my = m;
         fclose(f);
     }
     if (!s_my.have) {          /* until one is saved: high behind the offense */
@@ -138,11 +165,15 @@ static int mycam_save(const MyCam *m)
     }
     fprintf(f, "offset = %.1f %.1f %.1f fov = %.1f\n"
                "aim = %.1f %.1f\n"
+               "follow = %s\n"
                "; My Camera (Pro Broadcast): the camera's position from the ball in cm\n"
-               "; (across, up, along the field in the offense's direction) and its field of view.\n"
+               "; (across, up, along the field) and its field of view.\n"
+               "; follow: which way \"along the field\" points. team = the way your team attacks\n"
+               ";   (stays on your side through turnovers; home team in CPU vs CPU or 2 teams),\n"
+               ";   offense = the way the offense goes (flips with possession), fixed = one end all game.\n"
                "; aim: it looks this far downfield of the ball, and this far above it (0 0 = at the ball).\n"
                "; Set it in a game: Free Cam, fly to the spot, Back + D-pad Up (any controller) or F5.\n",
-            m->dx, m->dy, m->dz, m->fov, m->ahead, m->lift);
+            m->dx, m->dy, m->dz, m->fov, m->ahead, m->lift, k_follow_key[s_follow]);
     if (fclose(f) != 0) {
         fprintf(stderr, "[BROADCAST] My Camera NOT saved: write to %s failed\n", path);
         return 0;
@@ -152,14 +183,78 @@ static int mycam_save(const MyCam *m)
 }
 
 /* The way the offense is going: from the ball spot toward the line to gain. */
-static void update_dir(void)
+static int drive_dir(float *d)
 {
     uint32_t ds = MEM32(DRIVE);
     if (ds) {
         float ball = MEMF(ds + 0x18u), line = MEMF(ds + 0x28u);
-        if (isfinite(ball) && isfinite(line) && fabsf(line - ball) > 1.f)
-            s_dir = line > ball ? 1.f : -1.f;
+        if (isfinite(ball) && isfinite(line) && fabsf(line - ball) > 1.f) {
+            *d = line > ball ? 1.f : -1.f;
+            return 1;
+        }
     }
+    return 0;
+}
+static void update_dir(void) { drive_dir(&s_dir); }
+
+/* The way the home team attacks, from the offense's way and who has the ball.
+ * Read only at the line (flow 11/12): there the drive and the
+ * offense always agree, while during a play (an interception return, a punt)
+ * one of them can change before the other. The ends change only between
+ * quarters, so the next play at the line picks that up. */
+static void update_home_dir(uint32_t flow)
+{
+    uint32_t clk = MEM32(CLOCK), off = MEM32(OFF_SIDE);
+    float d;
+    if (clk != s_home_dir_clock) { s_home_dir = 0.f; s_home_dir_clock = clk; }
+    if (flow != 11u && flow != 12u) return;
+    if (!drive_dir(&d)) return;
+    if (off == SIDE_HOME) { /* the offense's way is the home team's */ }
+    else if (off == SIDE_AWAY) d = -d;
+    else return;
+    if (d != s_home_dir)
+        fprintf(stderr, "[BROADCAST] My Camera: home team attacks %sz (offense %s, flow %u)\n",
+                d > 0 ? "+" : "-", off == SIDE_HOME ? "home" : "away", (unsigned)flow);
+    s_home_dir = d;
+}
+
+/* The user's team: 1 home, 2 away, 0 none or both (CPU vs CPU, players on
+ * both teams). Coach Mode's team counts (it puts every port on the CPU). */
+static int user_side(void)
+{
+    int p, home = 0, away = 0;
+    if (nfl2k5_coach_enabled()) return nfl2k5_coach_team_home() ? 1 : 2;
+    for (p = 0; p < 4; p++) {
+        uint32_t v = MEM32(PORT_SIDE + PORT_STRIDE * (uint32_t)p);
+        if (v == 1u) home = 1; else if (v == 2u) away = 1;
+    }
+    return home && !away ? 1 : away && !home ? 2 : 0;
+}
+
+/* +1 / -1 along z: the "along the field" way of the saved offset. */
+static float cam_dir(uint32_t flow)
+{
+    update_dir();
+    update_home_dir(flow);
+    switch (s_follow) {
+    case FOLLOW_OFFENSE: return s_dir;
+    case FOLLOW_FIXED:   return 1.f;
+    default:
+        if (s_home_dir == 0.f) return s_dir;               /* not known yet: the first snap tells */
+        return user_side() == 2 ? -s_home_dir : s_home_dir;
+    }
+}
+
+int nfl2k5_broadcast_cam_follow(void) { mycam_load(); return s_follow; }
+int nfl2k5_broadcast_cam_follow_count(void) { return FOLLOW_COUNT; }
+const char *nfl2k5_broadcast_cam_follow_name(int v)
+{ return v >= 0 && v < FOLLOW_COUNT ? k_follow_name[v] : "?"; }
+void nfl2k5_broadcast_cam_set_follow(int v)
+{
+    mycam_load();
+    if (v < 0 || v >= FOLLOW_COUNT || v == s_follow) return;
+    s_follow = v;
+    mycam_save(&s_my);          /* keeps the saved spot, records the choice */
 }
 
 
@@ -300,20 +395,38 @@ static void service_freecam(float dt)
             nfl2k5_sandbox_world_restore(&s_fc_keep);
         }
     }
-    /* move_x, move_y, look_x, look_y, elevate, zoom */
-    nfl2k5_sandbox_world_input(lx, ly, rx, -ry, up, 0.f);
+    /* move_x, move_y, look_x, look_y, elevate, zoom. The world is right-handed
+     * (the view looks down -z; screen right = forward x up = (-cos yaw, 0,
+     * sin yaw)), so a bigger yaw turns LEFT: right stick right is fed as -rx
+     * to turn right. Right stick up looks up (it was fed -ry and looked
+     * down); left stick up flies where the camera looks, right strafes right. */
+    nfl2k5_sandbox_world_input(lx, ly, -rx, ry, up, 0.f);
     nfl2k5_sandbox_world_tick(dt);
     {
         Nfl2k5SandboxWorldState w;
         nfl2k5_sandbox_world_get_state(&w);
+        if (w.camera_ready && w.y < 60.f) {   /* flying forward while looking down went under the field */
+            w.y = 60.f;
+            nfl2k5_sandbox_world_restore(&w);
+        }
         if (w.camera_ready) { s_fc_keep = w; s_fc_clock = MEM32(CLOCK); }
+        if (getenv("NFL2K5_MYCAM_TRACE")) {   /* stick checks: where Free Cam points */
+            static double next;
+            double now = (double)GetTickCount64();
+            if ((lx || ly || rx || ry) && now >= next) {
+                next = now + 250.0;
+                fprintf(stderr, "[MYCAM-TRACE] freecam stick l=%+.0f,%+.0f r=%+.0f,%+.0f eye=%.0f,%.0f,%.0f yaw=%.1f pitch=%.1f offense=%s\n",
+                        lx, ly, rx, ry, w.x, w.y, w.z, w.yaw, w.pitch,
+                        MEM32(OFF_SIDE) == SIDE_HOME ? "home" : MEM32(OFF_SIDE) == SIDE_AWAY ? "away" : "?");
+            }
+        }
     }
 }
 
 /* My Camera in play: hold the saved offset from the ball, aim at the ball. */
-static void service_mycam(float dt)
+static void service_mycam(float dt, uint32_t flow)
 {
-    float tx, ty, tz, ex, ey, ez, dx, dy, dz, len;
+    float tx, ty, tz, ex, ey, ez, dx, dy, dz, len, dir;
     Nfl2k5SandboxWorldState w;
     mycam_load();
     if (!s_armed) {
@@ -321,10 +434,23 @@ static void service_mycam(float dt)
         s_armed = 1;
     }
     if (!ball_target(&tx, &ty, &tz)) return;
-    update_dir();
+    dir = cam_dir(flow);
+    if (getenv("NFL2K5_MYCAM_TRACE")) {
+        static float last_dir; static uint32_t last_off, last_flow;
+        uint32_t off = MEM32(OFF_SIDE);
+        if (dir != last_dir || off != last_off || (flow == 11u && last_flow != 11u))
+            fprintf(stderr, "[MYCAM-TRACE] t=%llu dir=%+.0f follow=%s offense=%s off_dir=%+.0f home_dir=%+.0f user_side=%d "
+                    "ports=%u,%u,%u,%u flow=%u ball=%.0f,%.0f eye=%.0f,%.0f\n",
+                    (unsigned long long)GetTickCount64(), dir, k_follow_key[s_follow],
+                    off == SIDE_HOME ? "home" : off == SIDE_AWAY ? "away" : "?", s_dir, s_home_dir, user_side(),
+                    (unsigned)MEM32(PORT_SIDE), (unsigned)MEM32(PORT_SIDE + PORT_STRIDE),
+                    (unsigned)MEM32(PORT_SIDE + 2u * PORT_STRIDE), (unsigned)MEM32(PORT_SIDE + 3u * PORT_STRIDE),
+                    (unsigned)flow, tx, tz, s_eyex, s_eyez);
+        last_dir = dir; last_off = off; last_flow = flow;
+    }
     if (!s_have) {
         s_aimx = tx; s_aimy = ty; s_aimz = tz;
-        s_eyex = tx + s_my.dx * s_dir; s_eyey = ty + s_my.dy; s_eyez = tz + s_my.dz * s_dir;
+        s_eyex = tx + s_my.dx * dir; s_eyey = ty + s_my.dy; s_eyez = tz + s_my.dz * dir;
         s_have = 1;
     }
     /* The aim keeps up with a thrown ball; the camera body trails it a little,
@@ -332,11 +458,11 @@ static void service_mycam(float dt)
     s_aimx = approach(s_aimx, tx, 9.f, dt);
     s_aimy = approach(s_aimy, ty, 7.f, dt);
     s_aimz = approach(s_aimz, tz, 9.f, dt);
-    s_eyex = approach(s_eyex, s_aimx + s_my.dx * s_dir, 3.5f, dt);
+    s_eyex = approach(s_eyex, s_aimx + s_my.dx * dir, 3.5f, dt);
     s_eyey = approach(s_eyey, clampf(s_aimy + s_my.dy, 60.f, 20000.f), 3.5f, dt);
-    s_eyez = approach(s_eyez, s_aimz + s_my.dz * s_dir, 3.5f, dt);
+    s_eyez = approach(s_eyez, s_aimz + s_my.dz * dir, 3.5f, dt);
     ex = s_eyex; ey = s_eyey; ez = s_eyez;
-    dx = s_aimx - ex; dy = s_aimy + s_my.lift - ey; dz = s_aimz + s_my.ahead * s_dir - ez;
+    dx = s_aimx - ex; dy = s_aimy + s_my.lift - ey; dz = s_aimz + s_my.ahead * dir - ez;
     len = sqrtf(dx * dx + dy * dy + dz * dz);
     if (!(len > 1.f)) return;
     memset(&w, 0, sizeof w);
@@ -357,7 +483,9 @@ static void mycam_try_save(uint32_t flow)
     Nfl2k5SandboxWorldState w;
     float tx, ty, tz;
     MyCam m;
+    float dir;
     const char *why = NULL;
+    mycam_load();               /* the follow choice, before it is written back */
     nfl2k5_sandbox_world_get_state(&w);
     if (MEM32(IN_GAME) != 3u)
         why = "Start a game first, then fly Free Cam to the spot";
@@ -373,17 +501,19 @@ static void mycam_try_save(uint32_t flow)
         xbox_PresentToast("MY CAMERA", "Camera not saved", why, 4000);
         return;
     }
-    update_dir();
+    dir = cam_dir(flow);        /* the frame My Camera plays it back in */
     m.have = 1;
-    m.dx = (w.x - tx) * s_dir; m.dy = w.y - ty; m.dz = (w.z - tz) * s_dir;
+    m.dx = (w.x - tx) * dir; m.dy = w.y - ty; m.dz = (w.z - tz) * dir;
     m.fov = clampf(w.fov, 15.f, 90.f); m.ahead = m.lift = 0.f;
     if (!mycam_save(&m)) {
         xbox_PresentToast("MY CAMERA", "Camera not saved", "Couldn't write nfl2k5_camera.ini", 4000);
         return;
     }
     s_my = m; s_my_loaded = 1;
-    fprintf(stderr, "[BROADCAST] My Camera saved: offset %.0f,%.0f,%.0f fov %.0f (eye %.0f,%.0f,%.0f ball %.0f,%.0f,%.0f)\n",
-            m.dx, m.dy, m.dz, m.fov, w.x, w.y, w.z, tx, ty, tz);
+    fprintf(stderr, "[BROADCAST] My Camera saved: offset %.0f,%.0f,%.0f fov %.0f (eye %.0f,%.0f,%.0f ball %.0f,%.0f,%.0f) "
+            "follow=%s dir=%+.0f offense=%s user_side=%d\n",
+            m.dx, m.dy, m.dz, m.fov, w.x, w.y, w.z, tx, ty, tz, k_follow_key[s_follow], dir,
+            MEM32(OFF_SIDE) == SIDE_HOME ? "home" : MEM32(OFF_SIDE) == SIDE_AWAY ? "away" : "?", user_side());
     xbox_PresentToast("MY CAMERA", "Camera position saved",
                       "Pick \"My Camera\" on the Camera screen to play with it", 3500);
 }
@@ -480,7 +610,7 @@ void nfl2k5_broadcast_cam_service_pad(uint32_t buttons, int lx, int ly, int rx, 
     if (!(dt > 0.f) || dt > 0.1f) dt = 0.016f;
 
     if (s_mode == NFL2K5_BCAST_FREECAM) { service_freecam(dt); return; }
-    if (s_mode == NFL2K5_BCAST_CUSTOM) { service_mycam(dt); return; }
+    if (s_mode == NFL2K5_BCAST_CUSTOM) { service_mycam(dt, flow); return; }
 
     if (!s_armed) {
         if (!nfl2k5_sandbox_world_enter()) return;   /* arms the per-frame camera hook */

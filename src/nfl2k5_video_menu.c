@@ -197,12 +197,18 @@ extern int  nfl2k5_broadcast_cam_mode(void);
 extern void nfl2k5_broadcast_cam_set_mode(int);
 extern int  nfl2k5_broadcast_cam_mode_count(void);
 extern const char *nfl2k5_broadcast_cam_mode_name(int);
-static const char *const k_bcast_labels[] = { "Pro Broadcast" };
+extern int  nfl2k5_broadcast_cam_follow(void);
+extern void nfl2k5_broadcast_cam_set_follow(int);
+extern int  nfl2k5_broadcast_cam_follow_count(void);
+extern const char *nfl2k5_broadcast_cam_follow_name(int);
+/* row 1: which way My Camera's saved spot turns (Your Team / Offense / Fixed Side) */
+static const char *const k_bcast_labels[] = { "Pro Broadcast", "My Camera Follows" };
 static int bcast_toggle(int r) { (void)r; return 0; }   /* type 7: a value selector */
-static int bcast_values(int r) { (void)r; return nfl2k5_broadcast_cam_mode_count(); }
-static int bcast_get(int r) { (void)r; return nfl2k5_broadcast_cam_mode(); }
-static void bcast_set(int r, int v) { (void)r; nfl2k5_broadcast_cam_set_mode(v); }
-static void bcast_name(int r, int v, char *b, size_t n) { (void)r; snprintf(b, n, "%s", nfl2k5_broadcast_cam_mode_name(v)); }
+static int bcast_values(int r) { return r ? nfl2k5_broadcast_cam_follow_count() : nfl2k5_broadcast_cam_mode_count(); }
+static int bcast_get(int r) { return r ? nfl2k5_broadcast_cam_follow() : nfl2k5_broadcast_cam_mode(); }
+static void bcast_set(int r, int v) { if (r) nfl2k5_broadcast_cam_set_follow(v); else nfl2k5_broadcast_cam_set_mode(v); }
+static void bcast_name(int r, int v, char *b, size_t n)
+{ snprintf(b, n, "%s", r ? nfl2k5_broadcast_cam_follow_name(v) : nfl2k5_broadcast_cam_mode_name(v)); }
 
 #ifdef __ANDROID__
 /* ---- Phone Settings rows (src/platform/android/android_settings.c) ---- */
@@ -321,7 +327,7 @@ static VmScreen s_screens[] = {
     { "Presentation", 6, k_pres_labels, pres_toggle, pres_values, pres_get, pres_set, pres_name },
     { "Mod Packs", 0, s_mod_labels, mods_toggle, mods_values, mods_get, mods_set, mods_name },
     { "Coach Mode", 4, k_coach_labels, coach_toggle, coach_values, coach_get, coach_set, coach_name },
-    { "Pro Broadcast", 1, k_bcast_labels, bcast_toggle, bcast_values, bcast_get, bcast_set, bcast_name },
+    { "Pro Broadcast", 2, k_bcast_labels, bcast_toggle, bcast_values, bcast_get, bcast_set, bcast_name },
 #ifdef __ANDROID__
     { "Phone Settings", 0, s_phone_labels, nfl2k5_phone_toggle, nfl2k5_phone_values, nfl2k5_phone_get, nfl2k5_phone_set, phone_name },
 #endif
