@@ -571,6 +571,7 @@ static int vm_remove_links(uint32_t menu_header, const char *first, const char *
  *   Playlist < name (songs) >   Left/Right, LT/RT (or A) change the playlist
  *   Shuffle All                 (Play for the game's music and the Jukebox)
  *   Next Song, Previous Song
+ *   Song Titles < Short | Full File Name >   Left/Right or A switch it
  *   1. Title - Artist ...       every song of the playlist; A plays it, and on
  *
  * The game draws the rows from label buffers rewritten here, so the list
@@ -591,12 +592,14 @@ extern int nfl2k5_music_now(int *source, int *song);
 extern void nfl2k5_music_now_text(char *out, size_t n);
 extern void nfl2k5_music_play(int source, int song, int shuffle);
 extern void nfl2k5_music_skip(int dir);
+extern int nfl2k5_music_titles_full(void);
+extern void nfl2k5_music_set_titles_full(int full);
 
 #define ML_FSM        0x00A84B18u   /* the front end's screen stack (the pause menu's too) */
 #define ML_CHARS      96            /* a row's label buffer, UTF-16 characters */
 #define ML_SND_SELECT 0x00E7FD70u   /* L"Ambient: Menu Select" (retail) */
 #define ML_SND_CURSOR 0x00E7FD3Cu   /* L"Ambient: Menu Move Cursor" (retail) */
-enum { ML_PLAYLIST, ML_SHUFFLE, ML_NEXT, ML_PREV, ML_FIXED };
+enum { ML_PLAYLIST, ML_SHUFFLE, ML_NEXT, ML_PREV, ML_TITLES, ML_FIXED };
 
 static struct {
     uint32_t header, label[ML_ROWS], sub;
@@ -646,6 +649,7 @@ static void ml_text(int v, char *out, size_t n)
     case ML_SHUFFLE: snprintf(out, n, "%s", s_ml.source >= 2 ? "Shuffle All" : "Play"); break;
     case ML_NEXT: snprintf(out, n, "Next Song"); break;
     case ML_PREV: snprintf(out, n, "Previous Song"); break;
+    case ML_TITLES: snprintf(out, n, "Song Titles < %s >", nfl2k5_music_titles_full() ? "Full File Name" : "Short"); break;
     default:
         nfl2k5_music_song_text(s_ml.source, v - ML_FIXED, name, sizeof name);
         snprintf(out, n, "%s%d. %s",
@@ -682,7 +686,7 @@ static void ml_fit(char *t, int selected, DWORD now)
 static int ml_word_break(const char *t, uint32_t i)
 {
     return (i == 4 && !strncmp(t, "Next Song", 9)) || (i == 7 && !strncmp(t, "Shuffle All", 11)) ||
-           (i == 8 && !strncmp(t, "Previous Song", 13)) || (i == 8 && !strncmp(t, "Playlist <", 10));
+           (i == 8 && !strncmp(t, "Previous Song", 13)) || (i == 8 && !strncmp(t, "Playlist <", 10)) || (i == 4 && !strncmp(t, "Song Titles", 11));
 }
 
 static void ml_put(uint32_t p, const char *t, char *shown, int nbsp)
@@ -857,7 +861,8 @@ void nfl2k5_music_list_input(int port, XBOX_GAMEPAD *g)
     memcpy(s_ml.prev_analog[port], g->bAnalogButtons, 8);
     s_ml.prev_sx[port] = sx;
     s_ml.count = ml_count();
-    if (hstep) ml_playlist(hstep);
+    if (hstep && s_ml.sel == ML_TITLES) { nfl2k5_music_set_titles_full(!nfl2k5_music_titles_full()); s_ml.sound = 1; }
+    else if (hstep) ml_playlist(hstep);
     else if (page) ml_page(page);
     else if (step) ml_move(step, wrap);
     /* the list's buttons stop here; A, START, B and the rest go on to the game */
@@ -896,6 +901,7 @@ static void ml_fn(void)
         else if (v == ML_SHUFFLE) nfl2k5_music_play(s_ml.source, -1, s_ml.source >= 2);
         else if (v == ML_NEXT) nfl2k5_music_skip(1);
         else if (v == ML_PREV) nfl2k5_music_skip(-1);
+        else if (v == ML_TITLES) nfl2k5_music_set_titles_full(!nfl2k5_music_titles_full());
         else nfl2k5_music_play(s_ml.source, v - ML_FIXED, 0);
         if (s_ml.sounds && v != ML_PLAYLIST) {
             g_ecx = ML_SND_SELECT; g_edx = 0;

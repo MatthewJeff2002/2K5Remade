@@ -45,7 +45,9 @@ static FILE *open_path(const fs::path &p, const char *mode)
 
 struct Song {
     fs::path src, cache;
-    std::u16string title, artist;
+    std::u16string title, artist;          /* the short title (see nfl2k5_song_titles.inc.cpp) and the artist */
+    std::u16string full;                   /* the file name without its extension (Song Titles: Full) */
+    std::u16string tag_title, tag_artist, tag_album;
     uint32_t ms = 0;
     bool ready = false;
 };
@@ -161,31 +163,7 @@ static std::vector<fs::path> list(const fs::path &dir, bool want_dirs)
     return out;
 }
 
-static std::string strip_track_prefix(std::string t)
-{
-    size_t i = 0;
-    while (i < t.size() && std::isdigit((unsigned char)t[i])) i++;
-    if (i && i < t.size()) {
-        while (i < t.size() && (t[i] == ' ' || t[i] == '.' || t[i] == '-' || t[i] == '_')) i++;
-        t = t.substr(i);
-    }
-    return t;
-}
-
-static std::u16string title_from_name(const fs::path &file)
-{
-    std::string t = strip_track_prefix(u8(file.stem()));
-    size_t dash = t.find(" - ");
-    if (dash != std::string::npos) t = t.substr(dash + 3);
-    return u8_to_u16(t);
-}
-
-static std::u16string artist_from_name(const fs::path &file)
-{
-    std::string t = strip_track_prefix(u8(file.stem()));
-    size_t dash = t.find(" - ");
-    return dash == std::string::npos ? u"" : u8_to_u16(t.substr(0, dash));
-}
+#include "nfl2k5_song_titles.inc.cpp"
 
 // Parse duration (ms) directly from the ASF File Properties Object in the WMA header
 static uint32_t read_asf_duration_ms(const fs::path &wma_path)
@@ -227,12 +205,57 @@ static uint32_t read_asf_duration_ms(const fs::path &wma_path)
 
 static void read_tags(Song &s)
 {
-    s.title = title_from_name(s.src);
-    s.artist = artist_from_name(s.src);
+    Tags t = read_file_tags(s.src);
+    s.tag_title = t.title;
+    s.tag_artist = t.artist;
+    s.tag_album = t.album;
     std::error_code ec;
     if (fs::exists(s.cache, ec))
         s.ms = read_asf_duration_ms(s.cache);
 }
+
+/* The folder's songs: tags first, then each title from the override, the tag or the cleaned name. */
+static void name_songs(Album &al, const std::vector<std::u16string> &library_hints)
+{
+    std::vector<std::u16string> hints = library_hints;
+    {   /* "Rock / Live": each folder of the path, and their " - " parts */
+        const std::u16string &p = al.name;
+        size_t from = 0;
+        while (from <= p.size()) {
+            size_t e = p.find(u" / ", from);
+            if (e == std::u16string::npos) e = p.size();
+            add_hint(hints, p.substr(from, e - from));
+            from = e + 3;
+        }
+    }
+    for (const Song &s : al.songs) { if (!s.tag_artist.empty()) add_hint(hints, s.tag_artist); if (!s.tag_album.empty()) add_hint(hints, s.tag_album); }
+    for (Song &s : al.songs) {
+        std::u16string o, art;
+        s.full = squash(u8_to_u16(u8(s.src.stem())));
+        if (title_override(s.src, g_music, o)) s.title = o;
+        else if (!s.tag_title.empty()) s.title = s.tag_title;
+        else s.title = clean_name(s.full, hints, &art);
+        s.artist = !s.tag_artist.empty() ? s.tag_artist : art;
+        if (s.title.empty()) s.title = s.full;
+    }
+}
+
+static SDL_AtomicInt g_title_full;     /* Song Titles: 0 Short, 1 Full (the file name) */
+
+static const std::u16string &song_title(const Song &s) { return SDL_GetAtomicInt(&g_title_full) && !s.full.empty() ? s.full : s.title; }
+
+/* "Title - Artist" (Short) or the file name (Full), for Now Playing. */
+static std::u16string song_line(const Song &s, const std::u16string &album)
+{
+    if (SDL_GetAtomicInt(&g_title_full) && !s.full.empty()) return s.full;
+    std::u16string line = s.title;
+    const std::u16string &by = s.artist.empty() ? album : s.artist;
+    if (!by.empty() && key16(by) != key16(s.title)) line += u" - " + by;
+    return line;
+}
+
+
+extern "C" int nfl2k5_music_titles_full(void);
 
 static fs::path cache_name(const fs::path &src)
 {
@@ -375,7 +398,11 @@ static void collect_albums(const fs::path &dir, const std::string &name, int dep
             fprintf(stderr, "[MUSIC] skipped %s\n", u8(f).c_str());
         }
     }
-    if (!al.songs.empty()) g_albums.push_back(al);
+    if (!al.songs.empty()) {
+        if (name.empty()) al.name = u"Music";
+        name_songs(al, {});
+        g_albums.push_back(al);
+    }
     if (depth >= 3) return;
     for (const fs::path &d : list(dir, true)) {
         std::string sub = u8(d.filename());
@@ -397,6 +424,8 @@ static int SDLCALL worker_body(void *)
     SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
     size_t total = 0, todo = 0, failed = 0, skipped_bad = 0;
     std::error_code ec;
+    load_title_overrides(g_music);
+    nfl2k5_music_titles_full();         /* Song Titles from nfl2k5_music.ini */
     {   /* songs loose in Music itself */
         size_t before = g_albums.size();
         collect_albums(g_music, "", 3, total, todo);
@@ -422,6 +451,17 @@ static int SDLCALL worker_body(void *)
         }
     }
 #endif
+    {   /* names once more with the whole library's artists, albums and folder names as hints */
+        std::vector<std::u16string> lib;
+        for (const Album &al : g_albums) {
+            add_hint(lib, al.name);
+            for (const Song &s : al.songs) {
+                if (!s.tag_artist.empty()) add_hint(lib, s.tag_artist);
+                if (!s.tag_album.empty()) add_hint(lib, s.tag_album);
+            }
+        }
+        for (Album &al : g_albums) name_songs(al, lib);
+    }
     fprintf(stderr, "[MUSIC] library: %zu playlists, %zu songs, %zu to convert\n", g_albums.size(), total, todo);
     /* Publish only after all Album/Song entries have been appended. */
     SDL_SetAtomicInt(&g_music_ready, 1);
@@ -686,11 +726,7 @@ static bool show_now_playing(uint32_t id)
     if (SDL_GetAtomicInt(&g_music_ready) == 0) return false;
     size_t a = id >> 16, k = id & 0xFFFF;
     if (a >= g_albums.size() || k >= g_albums[a].songs.size()) return false;
-    const Song &song = g_albums[a].songs[k];
-    std::u16string sub = song.title;
-    const std::u16string &by = song.artist.empty() ? g_albums[a].name : song.artist;
-    if (!by.empty()) sub += u" - " + by;
-    return banner_show(u"Now Playing", sub);
+    return banner_show(u"Now Playing", song_line(g_albums[a].songs[k], g_albums[a].name));
 }
 
 extern "C" void xbox_MenuInvalidate(void);
@@ -1418,11 +1454,7 @@ static void now_playing_text(char *out, size_t n)
     uint32_t mode = 0, index = 0;
     size_t a = (size_t)cur >> 16, k = (size_t)cur & 0xFFFF;
     if (cur >= 0 && SDL_GetAtomicInt(&g_music_ready) && a < g_albums.size() && k < g_albums[a].songs.size()) {
-        const Song &s = g_albums[a].songs[k];
-        std::u16string line = s.title;
-        const std::u16string &by = s.artist.empty() ? g_albums[a].name : s.artist;
-        if (!by.empty()) line += u" - " + by;
-        text_full(line, out, n);
+        text_full(song_line(g_albums[a].songs[k], g_albums[a].name), out, n);
     } else if (retail_current(bank, mode, index)) {
         if (bank == RETAIL_CRIB) snprintf(out, n, "%s - %s", g_crib_tracks[index].title, g_crib_tracks[index].artist);
         else snprintf(out, n, "Original Menu Music %02u", index + 1);
@@ -1460,8 +1492,7 @@ extern "C" int nfl2k5_music_song_count(int source)
     return (int)folder_songs(folders[(size_t)(source - 2)]).size();
 }
 
-/* "Title - Artist" of song `song` of a folder (the folder's name when the
- * file names no artist would only repeat the playlist: left out). */
+/* The title of song `song` of a folder: short, or the file name (Song Titles). */
 extern "C" void nfl2k5_music_song_text(int source, int song, char *out, size_t n)
 {
     std::vector<size_t> folders = music_folders();
@@ -1471,10 +1502,7 @@ extern "C" void nfl2k5_music_song_text(int source, int song, char *out, size_t n
     size_t a = folders[(size_t)(source - 2)];
     std::vector<size_t> songs = folder_songs(a);
     if (song < 0 || (size_t)song >= songs.size()) return;
-    const Song &s = g_albums[a].songs[songs[(size_t)song]];
-    std::u16string line = s.title;
-    if (!s.artist.empty()) line += u" - " + s.artist;
-    text_full(line, out, n);
+    text_full(song_title(g_albums[a].songs[songs[(size_t)song]]), out, n);
 }
 
 /* The custom song playing now as (source, song), 1; 0 when none (the game's
@@ -1495,6 +1523,39 @@ extern "C" int nfl2k5_music_now(int *source, int *song)
 }
 
 extern "C" void nfl2k5_music_now_text(char *out, size_t n) { now_playing_text(out, n); }
+
+/* Song Titles: 0 Short (default), 1 Full; kept in nfl2k5_music.ini (song_titles = short / full). */
+extern "C" char *xbox_user_path(const char *rel, char *out, size_t n);
+
+static void titles_setting_load(void)
+{
+    static bool loaded;
+    char ip[1024], line[160], v[32];
+    if (loaded) return;
+    loaded = true;
+    if (FILE *f = fopen(xbox_user_path("nfl2k5_music.ini", ip, sizeof ip), "r")) {
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, " song_titles = %31s", v) == 1) SDL_SetAtomicInt(&g_title_full, !strcmp(v, "full"));
+        fclose(f);
+    }
+}
+
+extern "C" int nfl2k5_music_titles_full(void) { titles_setting_load(); return SDL_GetAtomicInt(&g_title_full); }
+
+extern "C" void nfl2k5_music_set_titles_full(int full)
+{
+    char ip[1024];
+    titles_setting_load();
+    SDL_SetAtomicInt(&g_title_full, full != 0);
+    if (FILE *f = fopen(xbox_user_path("nfl2k5_music.ini", ip, sizeof ip), "w")) {
+        fprintf(f, "; Music Player > Song Titles: short (the song's title tag, or the file name cleaned up;\n"
+                   "; Music\\titles.txt names your own) or full (the file name as it is)\n"
+                   "song_titles = %s\n", full ? "full" : "short");
+        fclose(f);
+    }
+    fprintf(stderr, "[MUSIC] Song Titles: %s\n", full ? "Full" : "Short");
+    xbox_MenuInvalidate();
+}
 
 /* Play a source: song < 0 from its first song (or the source as a whole),
  * else that song and on from it; shuffle plays a folder in a random order. */
@@ -1517,9 +1578,9 @@ extern "C" void nfl2k5_music_skip(int dir)
 
 /* ── F1 > Music Player ──────────────────────────────────────────────────────
  * Now playing, Next, Previous, the playlist (Left/Right on any row changes
- * it), Play all, Shuffle, then one row per song; the F1 page scrolls a long
+ * it), Play all, Shuffle, Song titles, then one row per song; the F1 page scrolls a long
  * page itself (nv2a_gpu_present.inc.c: LT/RT or Home/End jump a page). */
-enum { MP_NOW, MP_NEXT, MP_PREV, MP_SOURCE, MP_PLAY, MP_SHUFFLE, MP_SONGS };
+enum { MP_NOW, MP_NEXT, MP_PREV, MP_SOURCE, MP_PLAY, MP_SHUFFLE, MP_TITLES, MP_SONGS };
 
 static void mp_fit(char *s, size_t width)
 {
@@ -1546,6 +1607,7 @@ static void mp_label(int row, char *name, char *val, size_t n)
         break;
     case MP_PLAY: strcpy(name, g_ui_source >= 2 ? "Play all" : "Play"); break;
     case MP_SHUFFLE: strcpy(name, "Shuffle"); if (g_ui_source < 2) snprintf(val, n, "your folders"); break;
+    case MP_TITLES: strcpy(name, "Song titles"); snprintf(val, n, "%s", nfl2k5_music_titles_full() ? "Full file name" : "Short"); break;
     default:
         if (row >= MP_SONGS) {
             nfl2k5_music_song_text(g_ui_source, row - MP_SONGS, text, sizeof text);
@@ -1561,8 +1623,8 @@ static void mp_label(int row, char *name, char *val, size_t n)
 static void mp_change(int row, int dir)
 {
     int count = nfl2k5_music_source_count();
-    (void)row;
-    g_ui_source = (g_ui_source + count + dir) % count;      /* Left/Right on any row: the playlist */
+    if (row == MP_TITLES) { nfl2k5_music_set_titles_full(!nfl2k5_music_titles_full()); return; }
+    g_ui_source = (g_ui_source + count + dir) % count;      /* Left/Right on any other row: the playlist */
     xbox_MenuInvalidate();
 }
 
@@ -1574,6 +1636,7 @@ static void mp_activate(int row)
     else if (row == MP_SOURCE) mp_change(row, 1);
     else if (row == MP_PLAY) nfl2k5_music_play(g_ui_source, -1, 0);
     else if (row == MP_SHUFFLE) { if (g_ui_source >= 2) nfl2k5_music_play(g_ui_source, -1, 1); }
+    else if (row == MP_TITLES) mp_change(row, 1);
     else if (row >= MP_SONGS) nfl2k5_music_play(g_ui_source, row - MP_SONGS, 0);
     xbox_MenuInvalidate();
 }
