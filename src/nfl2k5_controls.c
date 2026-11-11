@@ -378,6 +378,25 @@ static int prompt_style(void)
     return nfl2k5_controls_style() == 1;
 }
 
+/* Short PlayStation names for the button sheet's shoulder cells
+ * (nv2a_gpu_prompts.inc.c), which follow the button map: with the
+ * PlayStation 2 layout the game's trigger prompts read L1 / R1. */
+static const char *const k_ps_short[C_COUNT] = {
+    "X", "O", "SQ", "TRI", "L1", "R1", "L2", "R2", "OPT", "SHR", "L3", "R3", "UP", "DN", "LT", "RT" };
+static unsigned prompt_layout(char labels[4][8])
+{
+    /* cells (0,2) (1,2) (2,2) (3,2): the game's LT, RT, Black, White */
+    static const int cell_btn[4] = { C_LT, C_RT, C_RB, C_LB };
+    unsigned sig = 1;
+    for (int i = 0; i < 4; i++) {
+        int m = s_cfg.map[cell_btn[i]];
+        if (m < 0 || m >= C_COUNT) m = cell_btn[i];
+        snprintf(labels[i], 8, "%s", k_ps_short[m]);
+        sig = sig * 31u + (unsigned)m;
+    }
+    return sig;
+}
+
 int nfl2k5_controls_key(int game_button)
 {
     return game_button >= 0 && game_button < K_COUNT ? s_cfg.keys[game_button] : 0;
@@ -897,11 +916,13 @@ static void p1_activate(int r)
 }
 static const XboxMenuPage k_p1 = { "CONTROLS", p1_count, p1_label, p1_change, p1_activate, NULL };
 
-static int p2_count(void) { return C_COUNT + 1; }
+static void cm_ps2_map(int *map);
+static int p2_count(void) { return C_COUNT + 2; }
 static void p2_label(int r, char *name, char *val, size_t n)
 {
     int ps = any_ps();
     if (r == C_COUNT) { strcpy(name, "Default layout"); val[0] = 0; return; }
+    if (r == C_COUNT + 1) { strcpy(name, "PlayStation 2 layout (L1/R1 = triggers)"); val[0] = 0; return; }
     snprintf(name, 64, "Game %s", k_ctl_names[r]);
     if (SDL_GetAtomicInt(&s_capture_pad) == r) snprintf(val, n, "press a controller button...");
     else snprintf(val, n, "%s%s", ps ? k_ps_names[s_cfg.map[r]] : k_ctl_names[s_cfg.map[r]],
@@ -918,6 +939,7 @@ static void p2_activate(int r)
 {
     if (r == -1) { SDL_SetAtomicInt(&s_capture_pad, -1); return; }
     if (r == C_COUNT) { for (int i = 0; i < C_COUNT; i++) s_cfg.map[i] = i; cfg_save(); xbox_MenuInvalidate(); return; }
+    if (r == C_COUNT + 1) { cm_ps2_map(s_cfg.map); cfg_save(); xbox_MenuInvalidate(); return; }
     s_capture_start = SDL_GetTicks();
     SDL_SetAtomicInt(&s_capture_pad, r);
     xbox_MenuInvalidate();
@@ -954,7 +976,9 @@ void nfl2k5_controls_menu_init(void)
     g_xbox_menu_pad = menu_pad;
     {
         extern int (*g_xbox_prompt_style)(void);
+        extern unsigned (*g_xbox_prompt_layout)(char labels[4][8]);
         g_xbox_prompt_style = prompt_style;
+        g_xbox_prompt_layout = prompt_layout;
     }
     t = SDL_CreateThread(capture_thread, "ctl_capture", NULL);
     if (t) SDL_DetachThread(t);
@@ -992,6 +1016,28 @@ static int cm_default_layout(void)
     return 1;
 }
 
+/* The PlayStation 2 layout (2026-11-09, a player asked for "PS2 controls"):
+ * the PS2 game has the Xbox's trigger actions on L1 / R1 and the White /
+ * Black actions on L2 / R2, so shoulders and triggers swap; the face
+ * buttons already sit where the PS2's do (A = Cross, B = Circle, X = Square,
+ * Y = Triangle). map[] is "game button <- controller button". */
+static void cm_ps2_map(int *map)
+{
+    for (int i = 0; i < C_COUNT; i++) map[i] = i;
+    map[C_LT] = C_LB;     /* game left trigger  <- L1 */
+    map[C_RT] = C_RB;     /* game right trigger <- R1 */
+    map[C_LB] = C_LT;     /* game White         <- L2 */
+    map[C_RB] = C_RT;     /* game Black         <- R2 */
+}
+
+static int cm_layout_now(void)
+{
+    int ps2[C_COUNT];
+    if (cm_default_layout()) return 0;
+    cm_ps2_map(ps2);
+    return memcmp(ps2, s_cfg.map, sizeof ps2) ? 2 : 1;
+}
+
 int nfl2k5_ctlmenu_rows(void) { return CM_COUNT; }
 const char *nfl2k5_ctlmenu_label(int r)
 {
@@ -1012,7 +1058,7 @@ int nfl2k5_ctlmenu_values(int r)
     case CM_VIBSTR: return 4;                 /* 25 50 75 100 % */
     case CM_DZL: case CM_DZR: case CM_DZT: return 51;   /* 0..50 % */
     case CM_PROMPTS: return 5;
-    case CM_LAYOUT: return 2;
+    case CM_LAYOUT: return 3;                 /* Default, PlayStation 2, Custom */
     default: return r >= CM_BUTTONS && r < CM_COUNT ? C_COUNT : 2;
     }
 }
@@ -1029,7 +1075,7 @@ int nfl2k5_ctlmenu_get(int r)
 #ifndef __ANDROID__
     case CM_MOUSE: return s_cfg.mouse;
 #endif
-    case CM_LAYOUT: return cm_default_layout() ? 0 : 1;
+    case CM_LAYOUT: return cm_layout_now();
     }
     return r >= CM_BUTTONS && r < CM_COUNT ? s_cfg.map[r - CM_BUTTONS] : 0;
 }
@@ -1047,9 +1093,11 @@ void nfl2k5_ctlmenu_set(int r, int v)
     case CM_MOUSE: s_cfg.mouse = v != 0; break;
 #endif
     case CM_LAYOUT:
-        /* Default restores the standard layout; Custom is shown while any
-         * button below is changed (choosing it alone changes nothing). */
+        /* Default restores the standard layout, PlayStation 2 sets that
+         * one; Custom is shown while any button below is changed in another
+         * way (choosing it alone changes nothing). */
         if (v == 0) for (int i = 0; i < C_COUNT; i++) s_cfg.map[i] = i;
+        else if (v == 1) cm_ps2_map(s_cfg.map);
         break;
     default:
         if (r < CM_BUTTONS || r >= CM_COUNT) return;
@@ -1066,7 +1114,7 @@ void nfl2k5_ctlmenu_value_name(int r, int v, char *b, size_t n)
     case CM_VIBSTR: snprintf(b, n, "%d%%", 25 * (v % 4 + 1)); return;
     case CM_DZL: case CM_DZR: case CM_DZT: snprintf(b, n, "%d%%", v); return;
     case CM_PROMPTS: snprintf(b, n, "%s", prompts[(unsigned)v % 5u]); return;
-    case CM_LAYOUT: snprintf(b, n, "%s", v ? "Custom" : "Default"); return;
+    case CM_LAYOUT: snprintf(b, n, "%s", v == 2 ? "Custom" : v == 1 ? "PlayStation 2" : "Default"); return;
     }
     if (r >= CM_BUTTONS && r < CM_COUNT) {
         int c = (unsigned)v % C_COUNT;

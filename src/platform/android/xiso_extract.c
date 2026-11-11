@@ -1,11 +1,21 @@
 /* ── First start on Android: unpack the player's NFL 2K5 disc image ──────
  *
  * The game reads its disc as files (original/default.xbe, vc_53450030/...).
- * A player who has only the .iso puts it in Internal storage/NFL2K5 or
- * Download; the first start finds it (an XDVDFS image holding default.xbe)
- * and unpacks it into <root>/original, with a progress bar. It unpacks into
+ * A player who has only the image puts it in Internal storage/NFL2K5 or
+ * Download (or a folder inside Download, or the same places on an SD card);
+ * the first start finds it (an XDVDFS image holding default.xbe) and unpacks
+ * it into <root>/original, with a progress bar. It unpacks into
  * original.part and renames at the end, so an interrupted start begins again.
- * The reader is tools/xiso_read.py's, in C. */
+ * The reader is tools/xiso_read.py's, in C.
+ *
+ * Accepted images (any of .iso, .xiso, .xiso.iso): an xiso (the game
+ * partition alone, extract-xiso / "ESPN NFL 2K5 (USA).xiso.iso"; XDVDFS at
+ * offset 0) and full disc dumps (Redump .iso: XDVDFS after the video
+ * partition, at one of the known offsets in xiso_open). Not accepted, with
+ * a message saying what to do: compressed or archived images (.zip .7z .rar
+ * .cso .cci .chd .gz), a PlayStation 2 disc, other versions of the game, and
+ * modded discs. An unpacked disc (a folder with default.xbe) is used where
+ * it is meant to go, <root>/original; one found elsewhere gets a message. */
 #if defined(__ANDROID__)
 #include <SDL3/SDL.h>
 #include <ctype.h>
@@ -222,6 +232,8 @@ void nfl2k5_android_notice(const char *title, const char *msg)
 static char s_ps2_iso[256];            /* a PlayStation 2 image seen while looking */
 static char s_wrong_iso[256];          /* an Xbox image of another version of the game */
 static char s_modded_iso[256];         /* a Mod Studio disc (SOFTDRINK): the USA game, patched */
+static char s_packed_iso[256];         /* a zipped or compressed image (.zip .7z .rar .cso .cci .chd .gz) */
+static char s_loose_dir[512];          /* an unpacked disc in the wrong folder */
 
 /* The executables the recompiled code was made from (src/main.c): the
  * retail USA default.xbe, and the same with the built-in widescreen patch. */
@@ -302,30 +314,90 @@ static int xiso_xbe_kind(Xiso *x)
     return ok;
 }
 
-static int ends_iso(const char *n)
+static int ends_with(const char *n, const char *ext)
 {
-    size_t l = strlen(n);
-    return l > 4 && (!strcasecmp(n + l - 4, ".iso") || (l > 5 && !strcasecmp(n + l - 5, ".xiso")));
+    size_t l = strlen(n), e = strlen(ext);
+    return l > e && !strcasecmp(n + l - e, ext);
 }
 
+static int ends_iso(const char *n)
+{
+    return ends_with(n, ".iso") || ends_with(n, ".xiso");
+}
+
+/* an archive or a compressed disc image the reader cannot open */
+static int ends_packed(const char *n)
+{
+    static const char *const ext[] = { ".zip", ".7z", ".rar", ".cso", ".cci", ".chd", ".gz", ".xz", ".zst", NULL };
+    int i;
+    for (i = 0; ext[i]; i++) if (ends_with(n, ext[i])) return 1;
+    return 0;
+}
+
+static int names_the_game(const char *n)
+{
+    char up[256];
+    int k;
+    for (k = 0; n[k] && k < 255; k++) up[k] = (char)toupper((unsigned char)n[k]);
+    up[k] = 0;
+    return strstr(up, "2K5") || strstr(up, "NFL") || strstr(up, "ESPN");
+}
+
+static void scan_dir(const char *dir, int depth, char *best, size_t n, int *score);
+
 /* The best disc image in the usual folders: an XDVDFS image, "2K5" in the
- * name preferred. */
+ * name preferred. Download and Documents are looked into one folder deep
+ * (an image saved inside its own folder), on the phone and on SD cards. */
 static int find_iso(char *best, size_t n)
 {
-    const char *dirs[] = { "/sdcard/NFL2K5", "/sdcard/Download", "/sdcard/Downloads", "/sdcard/Documents", "/sdcard",
-                           "/storage/emulated/0/Download", NULL };
+    static const char *const dirs[] = { "/sdcard/NFL2K5", "/sdcard/Download", "/sdcard/Downloads", "/sdcard/Documents",
+                                        "/sdcard", "/storage/emulated/0/Download", NULL };
     int score = -1, i;
+    DIR *st;
     best[0] = 0;
-    for (i = 0; dirs[i]; i++) {
-        DIR *d = opendir(dirs[i]);
+    for (i = 0; dirs[i]; i++) scan_dir(dirs[i], i == 0 || i == 4 ? 0 : 1, best, n, &score);
+    if ((st = opendir("/storage"))) {         /* SD cards and USB drives */
         struct dirent *e;
-        if (!d) continue;
+        while ((e = readdir(st)) != NULL) {
+            char v[512];
+            if (e->d_name[0] == '.' || !strcmp(e->d_name, "emulated") || !strcmp(e->d_name, "self")) continue;
+            snprintf(v, sizeof v, "/storage/%s/NFL2K5", e->d_name); scan_dir(v, 0, best, n, &score);
+            snprintf(v, sizeof v, "/storage/%s/Download", e->d_name); scan_dir(v, 1, best, n, &score);
+            snprintf(v, sizeof v, "/storage/%s", e->d_name); scan_dir(v, 0, best, n, &score);
+        }
+        closedir(st);
+    }
+    return best[0] != 0;
+}
+
+static void scan_dir(const char *dir, int depth, char *best, size_t n, int *score)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    if (!d) return;
+    {
         while ((e = readdir(d)) != NULL) {
             char p[1024], up[256];
             Xiso x;
             int s = 0, k;
-            if (!ends_iso(e->d_name)) continue;
-            snprintf(p, sizeof p, "%s/%s", dirs[i], e->d_name);
+            if (e->d_name[0] == '.') continue;
+            snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+            if (!ends_iso(e->d_name)) {
+                struct stat sb;
+                if (ends_packed(e->d_name)) {
+                    if (names_the_game(e->d_name) && !s_packed_iso[0])
+                        snprintf(s_packed_iso, sizeof s_packed_iso, "%s", e->d_name);
+                    continue;
+                }
+                if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode) && strcmp(e->d_name, "original") &&
+                        strcmp(e->d_name, "original.part")) {
+                    char x2[1100];
+                    snprintf(x2, sizeof x2, "%s/default.xbe", p);
+                    if (!s_loose_dir[0] && nfl2k5_android_xbe_file_ok(x2)) snprintf(s_loose_dir, sizeof s_loose_dir, "%s", p);
+                    if (depth > 0) scan_dir(p, depth - 1, best, n, score);
+                }
+                continue;
+            }
             if (!xiso_open(&x, p)) {
                 /* a PlayStation 2 disc (ISO 9660, "PLAYSTATION" system id) */
                 FILE *f = fopen(p, "rb");
@@ -350,11 +422,11 @@ static int find_iso(char *best, size_t n)
             if (strstr(up, "2K5")) s += 2;
             if (strstr(up, "NFL")) s += 1;
             if (strstr(up, "PATCHED") || strstr(up, "FIXED")) s -= 1;   /* modified images: the plain disc first */
-            if (s > score) { score = s; snprintf(best, n, "%s", p); }
+            fprintf(stderr, "[ISO] %s: the retail USA disc (%s)\n", p, x.base ? "full disc dump" : "xiso");
+            if (s > *score) { *score = s; snprintf(best, n, "%s", p); }
         }
         closedir(d);
     }
-    return best[0] != 0;
 }
 
 static void rm_tree(const char *path)
@@ -412,6 +484,23 @@ int nfl2k5_android_unpack_iso(const char *root)
                      "%s is the PlayStation 2 version of ESPN NFL 2K5. This port runs the original Xbox "
                      "game: it needs the Xbox disc image (it holds default.xbe).", s_ps2_iso);
             nfl2k5_android_notice("NFL 2K5: wrong disc image", msg);
+            return -1;
+        }
+        if (s_loose_dir[0]) {
+            snprintf(msg, sizeof msg,
+                     "An unpacked copy of the game is in %s. NFL 2K5 looks for it in %s/original: move or copy "
+                     "that folder there (its default.xbe should end up as %s/original/default.xbe) and open "
+                     "NFL 2K5 again.", s_loose_dir, root, root);
+            nfl2k5_android_notice("NFL 2K5: game folder in the wrong place", msg);
+            return -1;
+        }
+        if (s_packed_iso[0]) {
+            snprintf(msg, sizeof msg,
+                     "%s is a zipped or compressed disc image. NFL 2K5 reads the plain image: unzip or "
+                     "decompress it first (a file manager or ZArchiver can), so that you have a .iso or "
+                     ".xiso file, and put that in Download. CSO, CCI and CHD images must be turned back "
+                     "into an .iso on a PC first.", s_packed_iso);
+            nfl2k5_android_notice("NFL 2K5: compressed disc image", msg);
             return -1;
         }
         return 0;

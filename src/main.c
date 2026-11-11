@@ -981,6 +981,21 @@ static void *android_cpu_report_thread(void *arg)
             for (k = ntop; k > 0 && top[k - 1].pct10 < pct10; k--) if (k < 6) top[k] = top[k - 1];
             if (k < 6) { top[k].pct10 = pct10; top[k].name = cur[i].name; top[k].core = cur[i].core; if (ntop < 6) ntop++; }
         }
+        {   /* memory every 30 s: a phone that kills the game for memory shows it climbing here */
+            long rss = -1, hwm = -1, avail = -1;
+            char ml[160];
+            FILE *mf = fopen("/proc/self/status", "r");
+            while (mf && fgets(ml, sizeof ml, mf)) {
+                if (!strncmp(ml, "VmRSS:", 6)) rss = atol(ml + 6);
+                else if (!strncmp(ml, "VmHWM:", 6)) hwm = atol(ml + 6);
+            }
+            if (mf) fclose(mf);
+            mf = fopen("/proc/meminfo", "r");
+            while (mf && fgets(ml, sizeof ml, mf))
+                if (!strncmp(ml, "MemAvailable:", 13)) { avail = atol(ml + 13); break; }
+            if (mf) fclose(mf);
+            fprintf(stderr, "[MEM] game %ld MB (most %ld MB), phone has %ld MB free\n", rss / 1024, hwm / 1024, avail / 1024);
+        }
         if (np) {
             char line[512];
             int o = snprintf(line, sizeof line, "[CPU] last 30 s: %d.%d%% of one core in total;", total10 / 10, total10 % 10);
@@ -1260,6 +1275,24 @@ static void *android_perf_stats_thread(void *arg)
 #include <fcntl.h>
 #include <unwind.h>
 static struct sigaction s_crash_prev[32];
+/* <root>/cache/last-crash.txt, written by the handler: the next start reads
+ * it (src/platform/android/android_settings.c, graphics safety). */
+static char s_crash_marker[1024];
+static volatile int s_crash_gpu;          /* a frame of the crash is in a GPU driver */
+extern int gx_crash_summary(char *out, size_t n) __attribute__((weak));   /* gx_sdl.c */
+
+void nfl2k5_crash_marker_path(const char *root)
+{
+    snprintf(s_crash_marker, sizeof s_crash_marker, "%s/cache/last-crash.txt", root);
+}
+
+static int crash_lib_is_gpu(const char *f)
+{
+    return strstr(f, "vulkan") || strstr(f, "adreno") || strstr(f, "gsl") || strstr(f, "glnext") ||
+           strstr(f, "llvm") || strstr(f, "mali") || strstr(f, "turnip") || strstr(f, "freedreno") ||
+           strstr(f, "/vendor/") || strstr(f, "lavapipe") || strstr(f, "lvp") || strstr(f, "hook_impl") ||
+           strstr(f, "libSDL3");
+}
 
 static void crash_line(const char *s) { (void)!write(2, s, strlen(s)); }
 
@@ -1267,6 +1300,7 @@ static void crash_pc(uintptr_t pc)
 {
     char line[512];
     Dl_info di;
+    if (dladdr((void *)pc, &di) && di.dli_fname && crash_lib_is_gpu(di.dli_fname)) s_crash_gpu = 1;
     if (dladdr((void *)pc, &di) && di.dli_fname)
         snprintf(line, sizeof line, "[CRASH]   %s+0x%lx (%s)\n", strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname,
                  (unsigned long)(pc - (uintptr_t)di.dli_fbase), di.dli_sname ? di.dli_sname : "?");
@@ -1286,13 +1320,13 @@ static _Unwind_Reason_Code crash_frame(struct _Unwind_Context *c, void *arg)
 static void crash_handler(int sig, siginfo_t *si, void *uctx)
 {
     char line[256];
+    char comm[32] = "?";
     int n = 0;
     ucontext_t *uc = (ucontext_t *)uctx;
     snprintf(line, sizeof line, "[CRASH] signal %d (code %d) at address %p, thread %d\n", sig,
              si ? si->si_code : 0, si ? si->si_addr : NULL, (int)gettid());
     crash_line(line);
     {   /* the thread's name says whose it is (a driver's worker, the renderer...) */
-        char comm[32];
         int fd = open("/proc/thread-self/comm", O_RDONLY), k;
         if (fd >= 0) {
             k = (int)read(fd, comm, sizeof comm - 1);
@@ -1301,8 +1335,13 @@ static void crash_handler(int sig, siginfo_t *si, void *uctx)
                 comm[k] = 0;
                 crash_line("[CRASH] thread name: ");
                 crash_line(comm);
-            }
+                if (comm[k - 1] == '\n') comm[k - 1] = 0;
+            } else
+                strcpy(comm, "?");
         }
+        if (!strncmp(comm, "gx_", 3) || !strncmp(comm, "vk_", 3) || strstr(comm, "Adreno") || strstr(comm, "GPU") ||
+            strstr(comm, "gpu"))
+            s_crash_gpu = 1;
     }
 #if defined(__aarch64__)
     if (uc) {
@@ -1316,6 +1355,46 @@ static void crash_handler(int sig, siginfo_t *si, void *uctx)
 #endif
     crash_line("[CRASH] stack:\n");
     _Unwind_Backtrace(crash_frame, &n);
+    {   /* the renderer's state and its last frames (pipelines made, failed, waiting) */
+        static char summary[4096];
+        if (gx_crash_summary && gx_crash_summary(summary, sizeof summary) > 0) crash_line(summary);
+    }
+    {   /* memory: what the process held, the most it held, what the phone had left */
+        static char buf[4096];
+        static const char *const files[] = { "/proc/self/status", "/proc/meminfo" };
+        unsigned fi;
+        for (fi = 0; fi < 2; fi++) {
+            int fd = open(files[fi], O_RDONLY), k;
+            char *p, *e;
+            if (fd < 0) continue;
+            k = (int)read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (k <= 0) continue;
+            buf[k] = 0;
+            for (p = buf; p && *p; p = e ? e + 1 : NULL) {
+                e = strchr(p, '\n');
+                if (e) *e = 0;
+                if (!strncmp(p, "VmRSS", 5) || !strncmp(p, "VmHWM", 5) || !strncmp(p, "VmSize", 6) ||
+                    !strncmp(p, "Threads", 7) || !strncmp(p, "MemTotal", 8) || !strncmp(p, "MemAvailable", 12)) {
+                    crash_line("[CRASH] memory ");
+                    crash_line(p);
+                    crash_line("\n");
+                }
+            }
+        }
+    }
+    if (s_crash_marker[0]) {
+        /* for the next start: which thread, whether a GPU driver was in it */
+        int fd = open(s_crash_marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            snprintf(line, sizeof line, "signal %d\nthread %s\ngpu %d\naddress %p\n", sig, comm, s_crash_gpu,
+                     si ? si->si_addr : NULL);
+            (void)!write(fd, line, strlen(line));
+            close(fd);
+        }
+    }
+    crash_line(s_crash_gpu ? "[CRASH] a GPU driver or the renderer is in this crash\n"
+                           : "[CRASH] no GPU driver frame seen in this crash\n");
     if (si && sig == SIGSEGV) {
         /* what the address space looks like around the fault: whether the
          * page is mapped at all, and what the neighbours are */
@@ -1357,13 +1436,19 @@ static void android_crash_reporter(void)
  * /sdcard/NFL2K5 needs "All files access" on Android 11+. */
 static void android_pick_root(void)
 {
-    const char *cands[4];
+    const char *cands[5];
     char probe[1024];
     int n = 0;
+    extern const char *nfl2k5_android_folder_boot(void);   /* platform/android/game_folder.c */
+    const char *chosen;
     if (getenv("NFL2K5_ROOT")) return;
-    cands[n++] = SDL_GetAndroidExternalStoragePath();
-    cands[n++] = "/sdcard/NFL2K5";
-    cands[n++] = "/storage/emulated/0/NFL2K5";
+    chosen = nfl2k5_android_folder_boot();                  /* Phone Settings > Game Folder (SD card) */
+    if (chosen) cands[n++] = chosen;        /* a chosen folder is the only one looked at */
+    else {
+        cands[n++] = SDL_GetAndroidExternalStoragePath();
+        cands[n++] = "/sdcard/NFL2K5";
+        cands[n++] = "/storage/emulated/0/NFL2K5";
+    }
     extern int nfl2k5_android_xbe_file_ok(const char *path);   /* platform/android/xiso_extract.c */
     for (int i = 0; i < n; i++) {
         if (!cands[i]) continue;
@@ -1383,9 +1468,10 @@ static void android_pick_root(void)
     {
         /* Only the disc image on the phone: unpack it (first start only). */
         extern int nfl2k5_android_unpack_iso(const char *root);   /* platform/android/xiso_extract.c */
-        int r = nfl2k5_android_unpack_iso("/sdcard/NFL2K5");
+        const char *into = chosen ? chosen : "/sdcard/NFL2K5";
+        int r = nfl2k5_android_unpack_iso(into);
         if (r > 0) {
-            setenv("NFL2K5_ROOT", "/sdcard/NFL2K5", 1);
+            setenv("NFL2K5_ROOT", into, 1);
             setenv("NFL2K5_PORTABLE", "1", 1);
             return;
         }
@@ -1394,10 +1480,14 @@ static void android_pick_root(void)
     {
         char msg[1536];
         snprintf(msg, sizeof msg,
-                 "Game files not found.\n\nPut your NFL 2K5 disc image (.iso) in Download or in "
-                 "Internal storage > NFL2K5, and make sure NFL 2K5 has All files access "
-                 "(Settings > Apps > NFL 2K5 > Permissions). The first start unpacks it.\n\n"
-                 "Or copy default.xbe and the vc_53450030 folder into Internal storage > NFL2K5 > original.");
+                 "Game files not found.\n\nPut your NFL 2K5 Xbox disc image in Download or in "
+                 "Internal storage > NFL2K5 (or the same folders on the SD card), and make sure NFL 2K5 has "
+                 "All files access (Settings > Apps > NFL 2K5 > Permissions). The first start unpacks it.\n\n"
+                 "Accepted: the USA Xbox disc as .iso or .xiso (an xiso such as \"ESPN NFL 2K5 (USA).xiso.iso\", "
+                 "or a full Redump .iso). Not accepted: zipped or compressed images (.zip, .7z, .rar, .cso, .cci): "
+                 "unzip them first.\n\n"
+                 "Or copy the unpacked disc (default.xbe and the vc_53450030 folder) into "
+                 "Internal storage > NFL2K5 > original.");
         extern void nfl2k5_android_notice(const char *title, const char *msg);
         nfl2k5_android_notice("NFL 2K5: game files not found", msg);
         exit(1);
@@ -1479,6 +1569,13 @@ int main(int argc, char **argv)
         pthread_t t;
         mkdir("/sdcard/NFL2K5", 0755);
         snprintf(lp, sizeof lp, "%s/nfl2k5.log", getenv("NFL2K5_ROOT") ? getenv("NFL2K5_ROOT") : "/sdcard/NFL2K5");
+        {   /* the last run's log is kept: after a crash it is the one that says why */
+            char prev[1024];
+            snprintf(prev, sizeof prev, "%s", lp);
+            if (strrchr(prev, '/')) strcpy(strrchr(prev, '/') + 1, "previous-run.log");
+            remove(prev);
+            rename(lp, prev);
+        }
         lf = fopen(lp, "w");
         if (!lf) {
             snprintf(lp, sizeof lp, "%s/nfl2k5.log", SDL_GetAndroidExternalStoragePath());
@@ -1505,6 +1602,12 @@ int main(int argc, char **argv)
                 fprintf(stderr, "[BUILD] %.*s\n", (int)info_size, info);
             SDL_free(info);
         }
+        /* from NFL2K5Activity (DeviceReport.java): the device and how the last run ended */
+        if (getenv("NFL2K5_DEVICE")) fprintf(stderr, "[DEVICE] %s\n", getenv("NFL2K5_DEVICE"));
+        if (getenv("NFL2K5_DEVICE_PROFILE") && *getenv("NFL2K5_DEVICE_PROFILE"))
+            fprintf(stderr, "[DEVICE] safety profile: %s\n", getenv("NFL2K5_DEVICE_PROFILE"));
+        if (getenv("NFL2K5_DISPLAY_MODE")) fprintf(stderr, "[DEVICE] display: %s\n", getenv("NFL2K5_DISPLAY_MODE"));
+        if (getenv("NFL2K5_LAST_EXIT")) fprintf(stderr, "[LAST-EXIT] %s\n", getenv("NFL2K5_LAST_EXIT"));
         android_crash_reporter();
         {
             /* Android's own log of the run before this one -- the system's crash
@@ -1526,6 +1629,23 @@ int main(int argc, char **argv)
     }
     android_pick_root();
     fprintf(stderr, "[ANDROID] game folder %s\n", getenv("NFL2K5_ROOT"));
+    {   /* Android's record of how the previous run ended (DeviceReport.java), beside the log and in it */
+        char src[1024], dst[1024], line[600];
+        const char *app = SDL_GetAndroidExternalStoragePath();
+        FILE *in, *out;
+        int lines = 0;
+        snprintf(src, sizeof src, "%s/previous-run-exit.txt", app ? app : "");
+        snprintf(dst, sizeof dst, "%s/previous-run-exit.txt", getenv("NFL2K5_ROOT") ? getenv("NFL2K5_ROOT") : "/sdcard/NFL2K5");
+        if (app && (in = fopen(src, "r"))) {
+            out = strcmp(src, dst) ? fopen(dst, "w") : NULL;
+            while (fgets(line, sizeof line, in)) {
+                if (out) fputs(line, out);
+                if (lines++ < 80) fprintf(stderr, "[LAST-EXIT] %s%s", line, strchr(line, '\n') ? "" : "\n");
+            }
+            fclose(in);
+            if (out) fclose(out);
+        }
+    }
     setenv("RECOMP_RENDERER", "vulkan", 0);   /* the GPU renderer (gx) on Vulkan; "cpu" for software */
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");   /* SDL picked portrait from the 640x480 window */
     if (getenv("NFL2K5_GAME_MODE"))
@@ -1551,8 +1671,12 @@ int main(int argc, char **argv)
     {
         extern void nfl2k5_touch_pad_init(void);   /* on-screen controls (platform/android/touch_pad.c) */
         extern void nfl2k5_android_settings_init(void);   /* Phone Settings (platform/android/android_settings.c) */
-        nfl2k5_android_settings_init();
+        nfl2k5_android_settings_init();   /* reads the last crash's marker first (graphics safety) */
         nfl2k5_touch_pad_init();
+        {
+            extern void nfl2k5_crash_marker_path(const char *root);
+            nfl2k5_crash_marker_path(getenv("NFL2K5_ROOT") ? getenv("NFL2K5_ROOT") : "/sdcard/NFL2K5");
+        }
     }
     {
         pthread_t t;

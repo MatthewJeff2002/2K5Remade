@@ -83,14 +83,48 @@ packages, Sandbox, the Team Builder or the save converter yet.
    put the game in the app's own folder (`Android/data/com.nfl2k5.pc`) instead
    of `/NFL2K5`, copy that folder somewhere safe before uninstalling, because
    Android deletes it with the app.
-3. Copy your disc image (`.iso`) into the phone's **Download** folder.
+3. Copy your disc image into the phone's **Download** folder (a folder inside
+   Download, `/NFL2K5`, or the same places on an SD card work too).
+   **Accepted:** the original **USA Xbox** disc as `.iso`, `.xiso` or
+   `.xiso.iso`: an **xiso** (for example `ESPN NFL 2K5 (USA).xiso.iso`, made
+   with extract-xiso or similar) or a **full disc dump** (Redump `.iso`).
+   **Not accepted:** zipped or compressed images (`.zip`, `.7z`, `.rar`,
+   `.cso`, `.cci`, `.chd`): unzip first; CSO/CCI/CHD must be turned back into
+   an `.iso` on a PC. A PlayStation 2 disc, a PAL or other version, or a
+   SOFTDRINK / Mod Studio patched disc is refused with a message saying why.
+   An already unpacked disc also works: put `default.xbe` and the
+   `vc_53450030` folder in `/NFL2K5/original`.
 4. Open NFL 2K5 and turn on **All files access** when Android asks. The game
-   finds the ISO, unpacks it into `/NFL2K5` (keep the phone plugged in and the
-   app open), then boots. You can delete the ISO afterwards.
+   finds the image, unpacks it into `/NFL2K5` (keep the phone plugged in and the
+   app open), then boots. You can delete the image afterwards.
 
 Phone settings are under **Options > Phone Settings** (touch controls, size and
-opacity, Battery Saver, Pause When Leaving, Add Songs), plus **Options >
-Controls** (remap, dead zone, vibration) and a touch layout editor.
+opacity, Battery Saver, Pause When Leaving, Add Songs, Graphics Safety, Game
+Folder), plus **Options > Controls** (remap every button, a PlayStation 2
+layout, dead zones, vibration) and a touch layout editor.
+
+**Game folder on an SD card:** Options > Phone Settings > **Game Folder**
+picks Internal storage or an SD card. Nothing happens until you close the game
+and open it again: then a screen asks first (**A** copy and switch, **B** keep
+it where it is). The move copies every file and checks each copy before it
+switches; **the old folder is never deleted**, so delete it yourself with a
+file manager once you are happy. If the card already has an NFL2K5 folder you
+can use it as it is (**A**) or copy over it (**X**). The log
+(`/NFL2K5/nfl2k5.log`) always stays on internal storage. If Android does not
+let the game write to the card's own `NFL2K5` folder, it uses the card's app
+folder (`Android/data/com.nfl2k5.pc/files/NFL2K5`) and says so: Android deletes
+that folder if you uninstall the app.
+
+**Graphics Safety** (Options > Phone Settings): if the game crashes inside the
+graphics driver, the next start turns safe mode on by itself and says so: new
+scenes then pause for a moment the first time they appear, instead of
+crashing. **Automatic** (the default) does this, **On** always uses it, **Off**
+never does. Snapdragon 8 Gen 2 and newer phones and handhelds (Adreno 740+,
+for example the Ayn Thor and Retroid Pocket 6) start with safe mode on
+(Automatic), compile one graphics pipeline at a time and run their screen in
+its 60 Hz mode. The first time each scene appears it can pause briefly; later
+starts are smooth because compiled pipelines are kept. Set Graphics Safety to
+**Off** to try background compiles instead.
 
 ## Video and renderers
 
@@ -130,6 +164,14 @@ Xbox's own 720x480; up to 16x). Nothing in the game caps it behind your back:
   dead zones and vibration.
 - On Android: touch controls (Auto / On / Off), a layout editor, and phone
   vibration as rumble.
+- **Options > Controls** (every platform) remaps each game button to any
+  controller button. **Button Layout > PlayStation 2** gives the PS2 game's
+  layout: **L1 / R1** do what the Xbox triggers do and **L2 / R2** what White /
+  Black do; the face buttons stay (Cross = A, Circle = B, Square = X, Triangle
+  = Y). With **Button Prompts > PlayStation** (or Automatic with a PlayStation
+  controller) the game's button icons show Cross, Circle, Square, Triangle and
+  the L1/R1/L2/R2 names of the buttons you actually press, now on Android and
+  Linux too.
 
 ## Music Player
 
@@ -166,6 +208,12 @@ To play the original game while a pack is selected, start the game with
 controlling the quarterback.
 
 ## MyCareer home (new, with SOFTDRINK v0.9)
+
+**MyCareer only appears with SOFTDRINK 2K28 v0.9 installed and turned on**
+(Extras > Mods). The original game and SOFTDRINK v0.7 have no MyCareer. On
+Android: put `SOFTDRINK-2K28-v0.9.2k5patch` in Download, start the game, wait
+for "installed and selected", close and reopen the game, then look under
+**Game Modes > MyCareer**.
 
 SOFTDRINK 2K28 v0.9 has a MyCareer mode. This release adds our own layer on top
 of it (SOFTDRINK's files are not changed): instead of a menu, your career starts
@@ -270,8 +318,9 @@ The setting is not offered on phones without an Adreno GPU.
 - **Linux is untested on real hardware**: it has only run in a virtual machine
   with software graphics.
 - **Android**: some things have not been proven on real phones yet: the
-  choppiness reported on the Retroid Pocket 6, phone heat, a blink in the intro
-  movie, and Turnip drivers on real Adreno GPUs.
+  choppiness reported on the Retroid Pocket 6, crashes reported on the Ayn
+  Thor (0.8.1 adds Graphics Safety and a fuller crash log for them), phone
+  heat, a blink in the intro movie, and Turnip drivers on real Adreno GPUs.
 - **MyCareer on Linux and Android**: the new 3D apartment is Windows-only for
   now (on Linux it drew black in testing). On Linux and Android your home is
   the classic Crib room, drawn by the game itself, with the same front door,
@@ -291,6 +340,12 @@ graphics card, controller, and the exact steps. Attach a screenshot or short
 video and the log: on Windows `%LOCALAPPDATA%\NFL2K5-PC\xbox_kernel.log` and
 the `logs` folder there; on Linux `~/.local/share/NFL2K5-PC/logs/session.log`;
 on Android `/NFL2K5/nfl2k5.log`. Never upload game files.
+
+On Android, after a crash, open the game once more and wait for the title
+screen (that start saves what Android knows about the crash), close it, then
+send these files from the phone's `NFL2K5` folder: `previous-run.log` (the log
+of the run that crashed), `previous-run-system.log`, `previous-run-exit.txt`
+(Android 11 and later) and `nfl2k5.log`.
 
 ## Credits and licences
 
