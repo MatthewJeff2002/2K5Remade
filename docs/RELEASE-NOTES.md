@@ -57,6 +57,13 @@ your settings, saves, Music, mods and your own presentation packages are kept
   Down jump a page, Left/Right or LT/RT change the playlist, A plays the song.
   Shuffle All, Next Song and Previous Song are there too; the playing song is
   marked. F1 > Music Player lists every song as well (LT/RT jump a page).
+- **Short song titles**: the list shows "Subdivisions" for a file named
+  "1982 Subdivisions Rush-Signals". The title comes from your own
+  `Music\titles.txt` (lines like `file name = Short Title`), else the song's
+  title tag (MP3, M4A, FLAC, OGG, Opus, WAV), else the file name cleaned up
+  (track numbers, years, "(Official Video)"-style brackets, and the artist or
+  album when the folder or other songs' tags name it). Song Titles: Full File
+  Name in the Music Player shows the file names instead. See `Music\README.txt`.
 - **My Camera stays on your side.** It now follows the end your team attacks, so it
   no longer flips after an interception, punt or kickoff, and a spot saved on
   defense comes back the same on offense. New Camera-screen row "My Camera
