@@ -1,3 +1,74 @@
+# ESPN NFL 2K5 Native — 0.8.1 (Windows hotfix)
+
+A Windows hotfix for what players reported on 0.8.0 (the Android fixes on the
+same branch ship in their own APK). Extract the new zip over your game folder:
+your settings, saves, Music, mods and your own presentation packages are kept
+(see UPDATING in `HOW-TO-INSTALL.txt`).
+
+## Fixed
+
+- **The game no longer closes at start when the Music folder has a song or
+  folder whose name has accents or non-English letters.** A file that cannot
+  be read is skipped and named in the log; sub-folders are playlists too, and
+  songs straight in Music play as a "Music" playlist.
+- **Music Player** (F1 > Music Player): picking a folder or a song, Next song,
+  sub-folders, non-English names and holding a pick until you are back in the
+  menus were checked with recorded sound, with SOFTDRINK v0.9 and with the
+  original game. Accented names show without the accent instead of "?".
+- **Socks and other small parts drawing the wrong texture** (a grey/yellow
+  machine-like pattern): the renderer now notices when the game changes a
+  texture's smaller versions and respects the game's own limit on which ones
+  it uses.
+- **The darkened box in the middle of the screen between plays** (built-in
+  widescreen, worst at 21:9): full-screen fades now cover the whole picture.
+- **Shimmering** on yard lines and the crowd at the default render scale on
+  1080p screens.
+- **Direct3D 12 / Vulkan black screen with sound**: the game checks at start
+  that the graphics card and driver can show the picture. If not, or if nothing
+  reaches the screen, it says why, switches to Direct3D 11 and starts again.
+- **Exclusive fullscreen grey window** on Direct3D 12 / Vulkan: exclusive now
+  switches the display to the chosen resolution; if the display has no such
+  mode the menu says so and the game uses borderless.
+- **"It crashes / won't open"**: the Visual C++ runtime now ships next to the
+  game, and the game is built to run with older runtimes too. Instead of
+  closing silently the game explains what is wrong: no disc yet (it can unpack
+  your .iso by itself), started from inside the .zip, a folder it cannot write
+  to (Program Files), missing files. A crash leaves a report in
+  `%LOCALAPPDATA%\NFL2K5-PC\logs` and says so.
+- **Mod packs**: drag a .2k5patch onto NFL2K5.exe, or copy it into
+  `mods\patches` even while the game runs; no extract-xiso or other tool is
+  needed. Clearer messages, and a rewritten `HOW-TO-INSTALL.txt`.
+- **Rosters and saves**: a save you delete (in the game, or from
+  `saves\rosters` or `saves\UDATA`) no longer comes back from its other copy;
+  that copy is kept in `saves\backups\deleted`.
+- **Presentations**: art a package names but does not have is hidden instead
+  of drawing a broken-image icon (and is named in the log). NBC Sunday Night
+  Football shows team logos again, from the CBS 2026 package's logos. Updates
+  no longer write over your presentation or video settings (they ship as
+  `*.default.ini`).
+
+## Changed
+
+- Frame Rate Cap offers 30, 60 or Original. The game simulates at most 60
+  frames a second, so "120" and "Unlimited" were always a 60 lock and are
+  gone; more than 60 on screen is Frame Generation (Direct3D 12, off by
+  default).
+
+## Still known
+
+- Direct3D 12 / Vulkan compile new shaders the first time a scene appears (a
+  short stutter in the first minutes); later starts are smoother.
+- The CBS, NBC and FOX packages draw with a system font (their fonts are not
+  included), and NBC's own plates and branding art are not included.
+
+## If something goes wrong
+
+Send `session.log`, `xbox_kernel.log` and any `crash-*.txt` / `crash-*.dmp`
+from `%LOCALAPPDATA%\NFL2K5-PC\logs` (Win+R, paste the path), plus a
+screenshot and the exact text of any message.
+
+---
+
 # ESPN NFL 2K5 Native — 0.8.0
 
 Windows, Linux (experimental) and Android. You need a clean dump of your own
