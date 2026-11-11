@@ -62,6 +62,29 @@
         if (e.data && e.data.nfl2k5) api.dispatch(e.data.nfl2k5);
     });
     window.addEventListener('error', function (e) { api.log('script error: ' + e.message + ' @' + e.lineno); });
+    /* A picture the package names but its folder does not have (art left out
+     * of a release, a team without a logo, a file renamed in a player's own
+     * package): hidden instead of a broken-image icon, and named once in the
+     * game's log ([HTMLPRES] page: missing file ...) so it can be found. */
+    var missingFiles = {};
+    window.addEventListener('error', function (e) {
+        var el = e.target;
+        if (!el || el === window || !el.tagName) return;
+        var url = el.currentSrc || el.src || el.href || '';
+        if (el.tagName === 'IMG') el.style.visibility = 'hidden';
+        if (url === document.location.href) return;   /* an empty src: nothing was asked for */
+        if (url && !missingFiles[url]) {
+            missingFiles[url] = true;
+            api.log('missing file: ' + url.replace(/^https:\/\/presentation\.local\//, 'mods/presentations/'));
+        }
+    }, true);
+    /* a hidden picture shows again as soon as a later src loads (a package's
+       fallback logo). On document, not window: an element's load event never
+       reaches window, so the picture stayed hidden (the SNF blue logo box). */
+    document.addEventListener('load', function (e) {
+        var el = e.target;
+        if (el && el.tagName === 'IMG' && el.style.visibility === 'hidden') el.style.visibility = '';
+    }, true);
 
     window.NFL2K5 = api;
 })();
