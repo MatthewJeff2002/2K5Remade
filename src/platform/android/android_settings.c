@@ -318,6 +318,7 @@ static int heat_thread(void *arg)
  * a second crash also sets the pipeline cache file aside (kept as .bad).
  * Devices of the safety profile always compile one pipeline at a time. */
 
+static int s_profile_safe;             /* Automatic, and on because of the device profile */
 static int s_crash_kind;               /* 0 none, 1 GPU, 2 other, 3 native crash the handler missed */
 
 static void gpu_safety_boot(void)
@@ -367,6 +368,12 @@ static void gpu_safety_boot(void)
         save();
     }
     level = s_set.gpu_safety == 1 ? 0 : s_set.gpu_safety == 2 ? 1 : s_set.gpu_level;
+    /* The safety profile's devices start in safe mode on Automatic: in the ARM64
+     * test machine background compiles still crashed the driver with one compile
+     * at a time (2026-11-09), so one-at-a-time alone is not trusted. Off gives
+     * them background compiles back. */
+    if (s_set.gpu_safety == 0 && prof && *prof && level < 1) level = 1;
+    s_profile_safe = s_set.gpu_safety == 0 && prof && *prof;
     if (level >= 1) setenv("RECOMP_GX_ASYNC_PIPES", "0", 0);
     if (level >= 1 || (prof && *prof)) setenv("RECOMP_GX_PIPE_SERIAL", "1", 0);
     fprintf(stderr, "[SAFETY] Graphics Safety %s, level %d%s: background compiles %s, one compile at a time %s\n",
@@ -465,7 +472,8 @@ void nfl2k5_phone_value_name(int r, int v, char *b, size_t n)
     case PS_BATTERY: snprintf(b, n, "%s", v ? "On: 1x resolution, 30 FPS" : "Off"); break;
     case PS_HEAT: snprintf(b, n, "%s", v ? "On: can lower resolution" : "Off"); break;
     case PS_SAFETY:
-        snprintf(b, n, "%s", v == 1 ? "Off" : v == 2 ? "On" : s_set.gpu_level ? "Automatic: on after a crash" : "Automatic");
+        snprintf(b, n, "%s", v == 1 ? "Off" : v == 2 ? "On" : s_set.gpu_level ? "Automatic: on after a crash" :
+                 s_profile_safe ? "Automatic: on for this device" : "Automatic");
         break;
     case PS_FOLDER: nfl2k5_folder_name(v, b, n); break;
     default: snprintf(b, n, "%s", v ? "On" : "Off"); break;

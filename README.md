@@ -120,8 +120,11 @@ graphics driver, the next start turns safe mode on by itself and says so: new
 scenes then pause for a moment the first time they appear, instead of
 crashing. **Automatic** (the default) does this, **On** always uses it, **Off**
 never does. Snapdragon 8 Gen 2 and newer phones and handhelds (Adreno 740+,
-for example the Ayn Thor and Retroid Pocket 6) always compile one graphics
-pipeline at a time and run their screen in its 60 Hz mode.
+for example the Ayn Thor and Retroid Pocket 6) start with safe mode on
+(Automatic), compile one graphics pipeline at a time and run their screen in
+its 60 Hz mode. The first time each scene appears it can pause briefly; later
+starts are smooth because compiled pipelines are kept. Set Graphics Safety to
+**Off** to try background compiles instead.
 
 ## Video and renderers
 
