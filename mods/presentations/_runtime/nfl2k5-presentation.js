@@ -78,8 +78,10 @@
             api.log('missing file: ' + url.replace(/^https:\/\/presentation\.local\//, 'mods/presentations/'));
         }
     }, true);
-    /* a hidden picture shows again as soon as a later src loads */
-    window.addEventListener('load', function (e) {
+    /* a hidden picture shows again as soon as a later src loads (a package's
+       fallback logo). On document, not window: an element's load event never
+       reaches window, so the picture stayed hidden (the SNF blue logo box). */
+    document.addEventListener('load', function (e) {
         var el = e.target;
         if (el && el.tagName === 'IMG' && el.style.visibility === 'hidden') el.style.visibility = '';
     }, true);
