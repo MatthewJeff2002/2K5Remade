@@ -22,7 +22,7 @@ The list shows short titles ("Song Titles: Short", the default):
      track number or year ("01 - ", "1-03 ", "1982 ") goes; "(Official Video)",
      "[Lyrics]", "(Remastered 2011)" and the like go; the artist or album is
      taken off when the folder name or the other songs' tags name it (so
-     "Rush - Signals982 Subdivisions Rush-Signals.mp3" shows "Subdivisions").
+     "Rush - Signals\1982 Subdivisions Rush-Signals.mp3" shows "Subdivisions").
      When it is not sure, it keeps the longer name.
 Set Song Titles to "Full File Name" in the Music Player to see the file names.
 
