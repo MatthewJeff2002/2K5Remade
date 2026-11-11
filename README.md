@@ -103,6 +103,13 @@ opacity, Battery Saver, Pause When Leaving, Add Songs, Graphics Safety, Game
 Folder), plus **Options > Controls** (remap every button, a PlayStation 2
 layout, dead zones, vibration) and a touch layout editor.
 
+**HIDE / SHOW button:** nothing is drawn over the game while you play with a
+controller, or with Touch Controls set to Off. After you tap HIDE, the small
+SHOW button fades away after a few seconds; touch the screen once to bring it
+back and tap SHOW to get the controls. Phone Settings > **Show/Hide Button**:
+Auto (fades), Always, or Never. A **three-finger tap** always hides or shows the
+touch controls (it also turns them back on from Off).
+
 **Game folder on an SD card:** Options > Phone Settings > **Game Folder**
 picks Internal storage or an SD card. Nothing happens until you close the game
 and open it again: then a screen asks first (**A** copy and switch, **B** keep

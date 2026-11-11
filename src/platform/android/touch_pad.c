@@ -9,7 +9,15 @@
  * redrawn only when something changes. Options > Phone Settings picks
  * Automatic (hidden while a real controller is connected and nothing has been
  * touched for a while), On or Off, and their size and opacity; the small
- * HIDE / SHOW button under Back/Start switches between On and Off.
+ * HIDE / SHOW button under Back/Start hides and shows them.
+ *
+ * The SHOW button (2026-11-10, a Retroid player's screenshot had it at the
+ * top of a match): never drawn while a controller is in use or with the
+ * controls Off; once the player hid the controls it fades after a few
+ * seconds without a touch, the next touch anywhere brings it back, and a tap
+ * on it shows the controls. Phone Settings > Show/Hide Button: Auto (that),
+ * Always (no fading) or Never; a three-finger tap always hides/shows the
+ * controls (and turns Off controls back to Automatic).
  * Phone Settings > Edit Touch Layout moves and resizes the controls; there is
  * one layout for the menus and one for the game itself (touch_layout.ini). */
 #if defined(__ANDROID__)
@@ -36,6 +44,9 @@ void nfl2k5_touch_set_mode(int m);
 float nfl2k5_touch_scale(void);
 float nfl2k5_touch_alpha(void);
 int nfl2k5_in_match(void);              /* src/nfl2k5_presentation.cpp: a match is on screen */
+int nfl2k5_touch_button_mode(void);     /* Show/Hide Button: 0 auto, 1 always, 2 never */
+int nfl2k5_touch_hidden(void);          /* the player hid the controls */
+void nfl2k5_touch_set_hidden(int h);
 
 /* ---- layouts: each group of controls can be moved and resized ---------- */
 enum { G_STICK, G_DPAD, G_FACE, G_LT, G_WHITE, G_RT, G_BLACK, G_BACK, G_START, G_COUNT, G_NONE = -1 };
@@ -61,8 +72,31 @@ static int s_stick_active;
 static unsigned s_dpad;                        /* wButtons bits 0..3 */
 static int s_pressed[C_COUNT];
 static int s_back_key;                   /* the system Back button/gesture: the game's B */
-static Uint64 s_last_touch;
+static Uint64 s_last_touch, s_last_pad;
 static volatile int s_gen = 1;                 /* bumped by every change: redraw */
+static int s_toggle_level;                     /* SHOW button opacity step drawn (0 gone .. 8 full) */
+static Uint64 s_three_t;                       /* three-finger tap: when the third finger came down */
+static int s_ndown;                            /* fingers on the screen */
+#define SHOW_FADE_AFTER_MS 4000u
+#define SHOW_FADE_MS 600u
+
+/* A controller is what the player is using: connected, and used since the
+ * last touch (or not touched at all). Nothing of ours covers the game then. */
+static int pad_in_use(void) { return SDL_HasGamepad() && s_last_pad >= s_last_touch; }
+
+/* SHOW/HIDE button opacity step, 0..8, at this moment. */
+static int toggle_level(void)
+{
+    int bm = nfl2k5_touch_button_mode(), m = nfl2k5_touch_mode();
+    Uint64 idle;
+    if (s_edit || m == 2 || bm == 2 || pad_in_use()) return 0;
+    if (m == 0 && SDL_HasGamepad() && SDL_GetTicks() - s_last_touch > 10000) return 0;
+    if (!nfl2k5_touch_hidden() || bm == 1) return 8;      /* HIDE beside the controls; Always */
+    idle = SDL_GetTicks() - s_last_touch;
+    if (idle <= SHOW_FADE_AFTER_MS) return 8;
+    if (idle >= SHOW_FADE_AFTER_MS + SHOW_FADE_MS) return 0;
+    return (int)(8 - (idle - SHOW_FADE_AFTER_MS) * 8 / SHOW_FADE_MS);
+}
 
 static int s_W = 960, s_H = 540;               /* image size (the screen's aspect) */
 static uint32_t *s_img;
@@ -127,22 +161,23 @@ static int in_rect(Rect r, float x, float y, float g)
     return x >= r.x - mx && x <= r.x + r.w + mx && y >= r.y - my && y <= r.y + r.h + my;
 }
 
-/* Whether the controls are up (Off leaves only the SHOW button). */
+/* Whether the controls are up (hidden by the player leaves at most the SHOW button). */
 static int controls_shown(void)
 {
     int m = nfl2k5_touch_mode();
     if (s_edit) return 1;
-    if (m == 2) return 0;
+    if (m == 2 || nfl2k5_touch_hidden() || pad_in_use()) return 0;   /* a controller in use: nothing over the game, even On */
     if (m == 0 && SDL_HasGamepad() && SDL_GetTicks() - s_last_touch > 10000) return 0;
     return 1;
 }
 
 /* Which control a touch at (x, y) is on; buttons get a 25% margin. */
+static int s_toggle_was_up;                    /* the button was visible before this touch */
 static int hit(float x, float y)
 {
     int k;
-    if (in_rect(btn_rect(C_TOGGLE), x, y, 1.3f)) return C_TOGGLE;
-    if (nfl2k5_touch_mode() == 2 && !s_edit) return C_NONE;
+    if (s_toggle_was_up && in_rect(btn_rect(C_TOGGLE), x, y, 1.3f)) return C_TOGGLE;
+    if ((nfl2k5_touch_mode() == 2 || nfl2k5_touch_hidden()) && !s_edit) return C_NONE;
     for (k = C_A; k <= C_Y; k++) if (in_circle(face(k), x, y, 1.35f)) return k;
     for (k = C_BLACK; k <= C_START; k++) if (in_rect(btn_rect(k), x, y, 1.25f)) return k;
     if (in_circle(dpad_c(), x, y, 1.2f)) return C_DPAD;
@@ -328,13 +363,47 @@ static bool SDLCALL on_event(void *ud, SDL_Event *e)
         s_back_key = e->type == SDL_EVENT_KEY_DOWN;
         return true;
     }
+    if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+            (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && (e->gaxis.value > 12000 || e->gaxis.value < -12000))) {
+        if (!pad_in_use()) s_gen++;            /* the controller takes over: clear the screen */
+        s_last_pad = SDL_GetTicks() + 1;
+        return true;
+    }
     if (e->type != SDL_EVENT_FINGER_DOWN && e->type != SDL_EVENT_FINGER_MOTION &&
             e->type != SDL_EVENT_FINGER_UP && e->type != SDL_EVENT_FINGER_CANCELED)
         return true;
     x = e->tfinger.x * (float)s_W;
     y = e->tfinger.y * (float)s_H;
     SDL_LockMutex(s_lock);
-    s_last_touch = SDL_GetTicks();
+    s_toggle_was_up = toggle_level() > 0;          /* a touch on a faded SHOW only brings it back */
+    if (e->type == SDL_EVENT_FINGER_DOWN) {
+        if (!s_toggle_was_up) s_gen++;
+        s_last_touch = SDL_GetTicks();
+    } else if (e->type == SDL_EVENT_FINGER_MOTION && s_toggle_level == 0 && nfl2k5_touch_hidden()) {
+        s_last_touch = SDL_GetTicks();
+        s_gen++;
+    } else
+        s_last_touch = SDL_GetTicks();
+    if ((e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) && s_ndown > 0) s_ndown--;
+    if (e->type == SDL_EVENT_FINGER_DOWN && s_edit) s_ndown++;
+    if (e->type == SDL_EVENT_FINGER_DOWN && !s_edit) {
+        /* three fingers down together: hide or show the controls whatever the settings */
+        int nf = 0;
+        SDL_Finger **fl = SDL_GetTouchFingers(e->tfinger.touchID, &nf);   /* the system's count, not ours */
+        SDL_free(fl);
+        if (fl) s_ndown = nf; else s_ndown++;
+        if (s_ndown >= 3 && SDL_GetTicks() - s_three_t > 800) {
+            s_three_t = SDL_GetTicks();
+            if (nfl2k5_touch_mode() == 2) { nfl2k5_touch_set_mode(0); nfl2k5_touch_set_hidden(0); }
+            else nfl2k5_touch_set_hidden(!nfl2k5_touch_hidden());
+            SDL_Log("NFL2K5 touch controls %s (three-finger tap)", nfl2k5_touch_hidden() ? "hidden" : "shown");
+            memset(s_fingers, 0, sizeof s_fingers);
+            recompute();
+            s_gen++;
+            SDL_UnlockMutex(s_lock);
+            return true;
+        }
+    }
     if (s_edit) {
         edit_touch(e, x, y);
         SDL_UnlockMutex(s_lock);
@@ -345,9 +414,10 @@ static bool SDLCALL on_event(void *ud, SDL_Event *e)
         if (slot < 0) for (i = 0; i < 10 && slot < 0; i++) if (!s_fingers[i].control) slot = i;
         if (slot >= 0) {
             int c = hit(x, y);
-            if (c == C_TOGGLE) {                   /* HIDE / SHOW: On <-> Off */
-                nfl2k5_touch_set_mode(nfl2k5_touch_mode() == 2 ? 1 : 2);
+            if (c == C_TOGGLE) {                   /* HIDE / SHOW: the player's own choice, not the setting */
+                nfl2k5_touch_set_hidden(!nfl2k5_touch_hidden());
                 c = C_NONE;
+                s_gen++;
             }
             s_fingers[slot].id = e->tfinger.fingerID;
             s_fingers[slot].control = c;
@@ -478,9 +548,12 @@ static void redraw(void)
     } else
     {
         Rect r = btn_rect(C_TOGGLE);
-        int off = nfl2k5_touch_mode() == 2;
-        fill_rect(r, 1, 1, 1, off ? 0.18f : 0.22f);
-        text(off ? "SHOW" : "HIDE", r.x + r.w * 0.5f, r.y + r.h * 0.5f, lab * 0.6f, off ? 0.55f : 0.8f);
+        int off = !controls_shown();
+        float f = s_toggle_level / 8.0f;
+        if (f > 0) {
+            fill_rect(r, 1, 1, 1, (off ? 0.18f : 0.22f) * f);
+            text(off ? "SHOW" : "HIDE", r.x + r.w * 0.5f, r.y + r.h * 0.5f, lab * 0.6f, (off ? 0.55f : 0.8f) * f);
+        }
         if (off) return;
     }
     s_alpha = nfl2k5_touch_alpha();
@@ -520,11 +593,17 @@ static int hud(const XboxHudFrame *f, XboxHudImage *img)
 {
     int gen, H;
     if (!f || f->bb_w <= 0 || f->bb_h <= 0) return 0;
-    /* Automatic: hidden while a controller is in and the screen has not been
-     * touched for 10 s (Off still draws the SHOW button) */
-    if (nfl2k5_touch_mode() == 0 && !controls_shown()) {
-        if (!s_hidden_logged++) SDL_Log("NFL2K5 touch controls hidden: controller connected");
-        return 0;
+    /* nothing at all while a controller is in use, with the controls Off, or
+     * once a hidden pad's SHOW button has faded */
+    {
+        int lvl = toggle_level();
+        if (lvl != s_toggle_level) { s_toggle_level = lvl; s_gen++; }
+        if (!controls_shown() && !lvl) {
+            if (!s_hidden_logged++)
+                SDL_Log("NFL2K5 touch controls hidden (%s)", pad_in_use() ? "controller in use" :
+                        nfl2k5_touch_mode() == 2 ? "Off" : nfl2k5_touch_hidden() ? "hidden by the player" : "controller connected");
+            return 0;
+        }
     }
     if (s_hidden_logged) { s_hidden_logged = 0; s_gen++; }
     H = (int)((float)s_W * f->bb_h / f->bb_w + 0.5f);
