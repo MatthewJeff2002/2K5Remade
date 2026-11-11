@@ -16,11 +16,13 @@ your settings, saves, Music, mods and your own presentation packages are kept
   menus were checked with recorded sound, with SOFTDRINK v0.9 and with the
   original game. Accented names show without the accent instead of "?".
 - **Socks and other small parts drawing the wrong texture** (a grey/yellow
-  machine-like pattern): the renderer now notices when the game changes a
-  texture's smaller versions and respects the game's own limit on which ones
-  it uses.
-- **The darkened box in the middle of the screen between plays** (built-in
-  widescreen, worst at 21:9): full-screen fades now cover the whole picture.
+  machine-like pattern): we could not make it happen on our PC yet, but fixed
+  two renderer faults that produce exactly this (smaller texture versions
+  that were never refreshed, and versions the game never uses). If you still
+  see it, please send a screenshot and your session.log.
+- **The box in the middle of the screen between plays** (built-in
+  widescreen, worst at 21:9): full-screen fills now cover the whole picture.
+  A short darkening can still show as a box now and then; we are on it.
 - **Shimmering** on yard lines and the crowd at the default render scale on
   1080p screens.
 - **Direct3D 12 / Vulkan black screen with sound**: the game checks at start
